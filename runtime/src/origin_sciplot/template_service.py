@@ -1,0 +1,587 @@
+"""Generic template workflow services used by the desktop application."""
+
+from __future__ import annotations
+
+import importlib.util
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+from .scientific_preview import ScientificPreviewError, render_scientific_preview_png
+from .scientific_workflow import (
+    ScientificColumnMapping,
+    ScientificPreparation,
+    ScientificWorkflowError,
+    mapping_context_options,
+    prepare_scientific,
+    role_options,
+)
+from .template_registry import TemplateManifest, TemplateRegistry
+from .xps_preview import XpsPreviewError, render_xps_preview_png
+from .xps_workflow import (
+    XpsColumnMapping,
+    XpsPreparation,
+    XpsWorkflowError,
+    prepare_xps,
+    select_xps_renderer_template_id,
+)
+
+
+class TemplateServiceError(ValueError):
+    """Stable failure raised by a top-level template workflow service."""
+
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+
+
+class TemplateConfirmationRequired(TemplateServiceError):
+    def __init__(self) -> None:
+        super().__init__(
+            "mapping_confirmation_required",
+            "Confirm the detected column roles before generating a preview or running Origin.",
+        )
+
+
+@dataclass(frozen=True)
+class MappingRoleOption:
+    key: str
+    label: str
+    unique: bool
+
+
+@dataclass(frozen=True)
+class ColumnMappingRequest:
+    columns: tuple[str, ...]
+    role_options: tuple[MappingRoleOption, ...]
+    suggested_roles: tuple[tuple[str, str], ...]
+    energy_kind: str | None
+    energy_kind_options: tuple[tuple[str, str], ...]
+    reasons: tuple[str, ...]
+    context_label: str | None = None
+    context_value: str | None = None
+    context_options: tuple[tuple[str, str], ...] = ()
+
+
+@dataclass(frozen=True)
+class TemplateSummary:
+    heading: str
+    facts: tuple[tuple[str, str], ...]
+    roles: tuple[tuple[str, str], ...]
+    components: tuple[str, ...]
+    warnings: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class PreparedTemplate:
+    template_id: str
+    renderer_template_id: str
+    source_path: str
+    source_size_bytes: int
+    source_format: str
+    source_sheet: str | None
+    source_columns: tuple[str, ...]
+    row_count: int
+    confidence: float
+    requires_confirmation: bool
+    plan_digest: str
+    summary: TemplateSummary
+    mapping_request: ColumnMappingRequest | None
+    payload: Any
+
+
+class XpsTemplateService:
+    """Top-level XPS workflow backed by internal fixed/adaptive renderers."""
+
+    _ROLE_OPTIONS = (
+        MappingRoleOption("x", "X 能量", True),
+        MappingRoleOption("raw", "Raw / 强度", True),
+        MappingRoleOption("background", "Background / 背景", True),
+        MappingRoleOption("envelope", "Envelope / 拟合包络", True),
+        MappingRoleOption("residual", "Residual / 残差", True),
+        MappingRoleOption("component", "Component peak / 分峰", False),
+        MappingRoleOption("ignored", "忽略", False),
+    )
+
+    def __init__(self, manifest: TemplateManifest) -> None:
+        self.manifest = manifest
+
+    @staticmethod
+    def _summary(preparation: XpsPreparation) -> TemplateSummary:
+        detection = preparation.detection
+        roles = preparation.roles
+        mode_labels = {
+            "scan": "扫描",
+            "fit": "拟合",
+            "fit_with_residual": "拟合（含残差列）",
+        }
+        energy_labels = {"binding": "Binding Energy", "kinetic": "Kinetic Energy", "unknown": "Energy"}
+        return TemplateSummary(
+            heading=f"XPS · {detection.spectrum_region} · {mode_labels[detection.mode]}",
+            facts=(
+                (
+                    "能量类型",
+                    f"{energy_labels[detection.energy_kind]} ({detection.energy_kind})",
+                ),
+                ("谱区", detection.spectrum_region),
+                ("模式", f"{mode_labels[detection.mode]} ({detection.mode})"),
+                ("内部 Profile", preparation.plot_spec.visual_profile),
+            ),
+            roles=(
+                ("X", roles.x),
+                ("Raw", roles.raw or "—"),
+                ("Background", roles.background or "—"),
+                ("Envelope", roles.envelope or "—"),
+                ("Residual", roles.residual or "—"),
+            ),
+            components=roles.components,
+            warnings=preparation.warnings,
+        )
+
+    @classmethod
+    def _mapping_request(cls, preparation: XpsPreparation) -> ColumnMappingRequest:
+        roles = preparation.roles
+        assignments = {column: "component" for column in preparation.source_columns}
+        assignments[roles.x] = "x"
+        if roles.raw:
+            assignments[roles.raw] = "raw"
+        for role, column in (
+            ("background", roles.background),
+            ("envelope", roles.envelope),
+            ("residual", roles.residual),
+        ):
+            if column:
+                assignments[column] = role
+        for column in roles.ignored:
+            assignments[column] = "ignored"
+        energy_kind = (
+            preparation.detection.energy_kind
+            if preparation.detection.energy_kind in {"binding", "kinetic"}
+            else None
+        )
+        return ColumnMappingRequest(
+            columns=preparation.source_columns,
+            role_options=cls._ROLE_OPTIONS,
+            suggested_roles=tuple((column, assignments[column]) for column in preparation.source_columns),
+            energy_kind=energy_kind,
+            energy_kind_options=(("binding", "Binding Energy"), ("kinetic", "Kinetic Energy")),
+            reasons=preparation.confirmation_reasons,
+            context_label="能量类型",
+            context_value=energy_kind,
+            context_options=(("binding", "Binding Energy"), ("kinetic", "Kinetic Energy")),
+        )
+
+    def _wrap(self, preparation: XpsPreparation) -> PreparedTemplate:
+        return PreparedTemplate(
+            template_id=self.manifest.id,
+            renderer_template_id=select_xps_renderer_template_id(preparation),
+            source_path=preparation.source_path,
+            source_size_bytes=preparation.source_size_bytes,
+            source_format=preparation.source_format,
+            source_sheet=preparation.source_sheet,
+            source_columns=preparation.source_columns,
+            row_count=preparation.row_count,
+            confidence=preparation.confidence,
+            requires_confirmation=preparation.requires_confirmation,
+            plan_digest=preparation.plan_digest,
+            summary=self._summary(preparation),
+            mapping_request=self._mapping_request(preparation),
+            payload=preparation,
+        )
+
+    def prepare(self, path: str | Path) -> PreparedTemplate:
+        try:
+            return self._wrap(prepare_xps(path))
+        except XpsWorkflowError as exc:
+            raise TemplateServiceError(exc.code, str(exc)) from exc
+
+    def confirm_mapping(
+        self,
+        prepared: PreparedTemplate,
+        *,
+        assignments: dict[str, str],
+        energy_kind: str,
+    ) -> PreparedTemplate:
+        if energy_kind not in {"binding", "kinetic"}:
+            raise TemplateServiceError("mapping_energy_kind", "Select Binding or Kinetic Energy.")
+        if set(assignments) != set(prepared.source_columns):
+            raise TemplateServiceError(
+                "mapping_incomplete", "Every source column must be assigned a role or ignored."
+            )
+        allowed = {option.key for option in self._ROLE_OPTIONS}
+        invalid = next((role for role in assignments.values() if role not in allowed), None)
+        if invalid is not None:
+            raise TemplateServiceError("mapping_unknown_role", f"Unknown mapping role: {invalid}")
+
+        def unique(role: str, *, required: bool = False) -> str | None:
+            matches = [column for column, assigned in assignments.items() if assigned == role]
+            if required and len(matches) != 1:
+                raise TemplateServiceError(
+                    f"mapping_{role}_required", f"Exactly one column must be assigned to {role}."
+                )
+            if len(matches) > 1:
+                raise TemplateServiceError(
+                    f"mapping_{role}_conflict", f"Only one column can be assigned to {role}."
+                )
+            return matches[0] if matches else None
+
+        mapping = XpsColumnMapping(
+            x=unique("x", required=True) or "",
+            raw=unique("raw", required=True) or "",
+            background=unique("background"),
+            envelope=unique("envelope"),
+            residual=unique("residual"),
+            components=tuple(
+                column for column in prepared.source_columns if assignments[column] == "component"
+            ),
+            ignored=tuple(column for column in prepared.source_columns if assignments[column] == "ignored"),
+            energy_kind=energy_kind,  # type: ignore[arg-type]
+        )
+        try:
+            return self._wrap(prepare_xps(prepared.source_path, column_mapping=mapping))
+        except XpsWorkflowError as exc:
+            raise TemplateServiceError(exc.code, str(exc)) from exc
+
+    def render_preview(self, prepared: PreparedTemplate) -> bytes:
+        if prepared.requires_confirmation:
+            raise TemplateConfirmationRequired()
+        try:
+            return render_xps_preview_png(prepared.payload)
+        except XpsPreviewError as exc:
+            raise TemplateServiceError(exc.code, str(exc)) from exc
+
+    @staticmethod
+    def worker_mapping(prepared: PreparedTemplate) -> dict[str, object] | None:
+        preparation: XpsPreparation = prepared.payload
+        return preparation.column_mapping.to_dict() if preparation.column_mapping else None
+
+
+class ScientificTemplateService:
+    """Shared public service for non-XPS scientific table templates."""
+
+    def __init__(self, manifest: TemplateManifest) -> None:
+        self.manifest = manifest
+
+    def _summary(self, preparation: ScientificPreparation) -> TemplateSummary:
+        spec = preparation.plot_spec
+        assignments = dict(preparation.assignments)
+        if self.manifest.id == "xrd":
+
+            def assigned(role: str) -> str:
+                columns = [
+                    column for column, assigned_role in preparation.assignments if assigned_role == role
+                ]
+                return ", ".join(columns) if columns else "—"
+
+            mode_label = "Rietveld 精修" if spec.plot_kind == "rietveld_refinement" else "普通图谱"
+            return TemplateSummary(
+                heading=f"{self.manifest.name} · {mode_label}",
+                facts=(
+                    ("绘图模式", spec.plot_mode),
+                    ("数据 Profile", spec.source_profile or "ordinary_xrd"),
+                    ("图形类型", spec.plot_kind),
+                    ("X 轴", spec.x_title),
+                    ("Y 轴", spec.y_title),
+                ),
+                roles=(
+                    ("X / 2θ", spec.x_column or "—"),
+                    ("Observed / 实测", assigned("observed")),
+                    ("Calculated / 计算", assigned("calculated")),
+                    ("Background / 背景", assigned("background")),
+                    ("Difference / 差值", assigned("difference")),
+                    ("Phase ticks / 物相刻线", assigned("phase_tick")),
+                    ("Support / 辅助控制", assigned("support")),
+                    ("Series / 普通图谱", assigned("series")),
+                ),
+                components=tuple(item.label for item in spec.series),
+                warnings=preparation.warnings,
+            )
+        if spec.plot_kind == "trajectory3d":
+            return TemplateSummary(
+                heading=f"{self.manifest.name} · {len(spec.group_order)} 条轨迹",
+                facts=(
+                    ("绘图模式", spec.plot_mode),
+                    ("图形类型", spec.plot_kind),
+                    ("X 轴", spec.x_title),
+                    ("Y 轴（真实第三变量）", spec.y_title),
+                    ("Z 轴", spec.z_title or "—"),
+                ),
+                roles=(
+                    ("X / Zreal", spec.x_column or "—"),
+                    ("Y / 第三变量", spec.y_column or "—"),
+                    ("Z / -Zimag", spec.series[0].source_column),
+                    ("Series", spec.category_column or "—"),
+                ),
+                components=spec.group_order,
+                warnings=preparation.warnings,
+            )
+        if spec.plot_kind == "density_ridgeline3d":
+            assigned = dict(preparation.assignments)
+
+            def column_for(role: str) -> str:
+                return next(
+                    (column for column, assigned_role in assigned.items() if assigned_role == role),
+                    "—",
+                )
+
+            return TemplateSummary(
+                heading=f"{self.manifest.name} · {len(spec.group_order)} 个有序条件",
+                facts=(
+                    ("绘图模式", spec.plot_mode),
+                    ("图形类型", spec.plot_kind),
+                    ("X 轴", spec.x_title),
+                    ("Y 轴（条件位置）", spec.y_title),
+                    ("Z 轴", spec.z_title or "Density"),
+                    (
+                        "Baseline focal locator / 基线焦点定位点",
+                        "用户提供的 X；Z 固定在基线 0（需确认）",
+                    ),
+                ),
+                roles=(
+                    ("Condition", spec.category_column or "—"),
+                    ("Condition position", spec.y_column or "—"),
+                    ("Density X", spec.x_column or "—"),
+                    ("Solid density", column_for("density_solid")),
+                    ("Dashed density", column_for("density_dashed")),
+                    ("Focal X", spec.focal_x_column or "—"),
+                ),
+                components=spec.group_order,
+                warnings=preparation.warnings,
+            )
+        if spec.plot_kind == "circular_network":
+            layout = spec.network_layout
+            panel_count = len(layout.panel_order) if layout is not None else 0
+            node_count = len(layout.node_order) if layout is not None else 0
+            edge_count = (
+                sum(len(panel.edges) for panel in layout.panels)
+                if layout is not None
+                else preparation.row_count
+            )
+            return TemplateSummary(
+                heading=f"{self.manifest.name} · {panel_count} 个面板",
+                facts=(
+                    ("绘图模式", spec.plot_mode),
+                    ("图形类型", spec.plot_kind),
+                    ("面板数", str(panel_count)),
+                    ("全局节点数", str(node_count)),
+                    ("有向边数", str(edge_count)),
+                ),
+                roles=(
+                    ("Panel", spec.panel_column or "—"),
+                    ("Source", spec.source_column or "—"),
+                    ("Target", spec.target_column or "—"),
+                    ("Weight", spec.weight_column or "—"),
+                    ("Sign", spec.sign_column or "—（中性）"),
+                    (
+                        "Node groups",
+                        (
+                            f"{spec.source_group_column} + {spec.target_group_column}"
+                            if spec.source_group_column and spec.target_group_column
+                            else "—"
+                        ),
+                    ),
+                    ("Edge label", spec.edge_label_column or "—"),
+                ),
+                components=layout.panel_order if layout is not None else (),
+                warnings=preparation.warnings,
+            )
+        x_value = spec.category_column or spec.x_column or spec.source_column or "—"
+        errors = [column for column, role in assignments.items() if role == "error"]
+        facts = (
+            ("绘图模式", spec.plot_mode),
+            ("图形类型", spec.plot_kind),
+            ("X 轴", spec.x_title),
+            ("Y 轴", "Feature（输入顺序）" if spec.plot_kind == "shap_summary" else spec.y_title),
+        )
+        if spec.y2_title:
+            facts = (*facts, ("右 Y 轴", spec.y2_title))
+        if spec.plot_kind == "sankey":
+            roles = (
+                ("Source", spec.source_column or "—"),
+                ("Target", spec.target_column or "—"),
+                ("Value", spec.series[0].source_column),
+            )
+        elif spec.plot_kind == "shap_summary":
+            series = spec.series[0]
+            shap_plan = spec.shap_plan
+
+            def shap_column(role: str) -> str:
+                return next(
+                    (column for column, assigned_role in assignments.items() if assigned_role == role),
+                    "—",
+                )
+
+            roles = (
+                ("Feature", spec.category_column or "—"),
+                ("SHAP value", series.source_column),
+                ("Feature value / color", series.color_column or "—"),
+                ("Sample ID / support", shap_column("sample_id")),
+                ("Feature order / support", shap_column("feature_order")),
+                ("Mean |SHAP|", shap_column("mean_abs_shap")),
+                ("Feature group", shap_column("feature_group")),
+                ("Group contribution (%)", shap_column("group_contribution")),
+            )
+            if shap_plan is not None:
+                facts = (
+                    *facts,
+                    ("SHAP 视觉 Profile", shap_plan.profile),
+                    ("SHAP 布局合同", shap_plan.layout_version),
+                    ("Mean |SHAP| 来源", shap_plan.mean_abs_source),
+                    ("分组贡献来源", shap_plan.group_contribution_source),
+                )
+            if spec.shap_dashboard is not None:
+                facts = (*facts, ("分栏模板配色", spec.shap_dashboard.palette_id),
+                         ("分栏布局合同", spec.shap_dashboard.layout_version),
+                         ("双层环图", "外环特征组 / 内环组内特征；共同总贡献分母"))
+        else:
+            roles = (
+                ("X", x_value),
+                ("Series", ", ".join(item.source_column for item in spec.series)),
+                ("Error", ", ".join(errors) if errors else "—"),
+            )
+        return TemplateSummary(
+            heading=f"{self.manifest.name} · {spec.plot_mode}",
+            facts=facts,
+            roles=roles,
+            components=tuple(item.label for item in spec.series),
+            warnings=preparation.warnings,
+        )
+
+    def _mapping_request(self, preparation: ScientificPreparation) -> ColumnMappingRequest:
+        contexts = mapping_context_options(self.manifest.id)
+        role_items = tuple(
+            MappingRoleOption(key, label, unique) for key, label, unique in role_options(self.manifest.id)
+        )
+        context_value = preparation.plot_spec.plot_mode if contexts else None
+        return ColumnMappingRequest(
+            columns=preparation.source_columns,
+            role_options=role_items,
+            suggested_roles=preparation.assignments,
+            energy_kind=context_value,
+            energy_kind_options=contexts,
+            reasons=preparation.confirmation_reasons,
+            context_label="绘图模式" if contexts else None,
+            context_value=context_value,
+            context_options=contexts,
+        )
+
+    def _wrap(self, preparation: ScientificPreparation) -> PreparedTemplate:
+        return PreparedTemplate(
+            template_id=self.manifest.id,
+            renderer_template_id=self.manifest.id,
+            source_path=preparation.source_path,
+            source_size_bytes=preparation.source_size_bytes,
+            source_format=preparation.source_format,
+            source_sheet=preparation.source_sheet,
+            source_columns=preparation.source_columns,
+            row_count=preparation.row_count,
+            confidence=preparation.confidence,
+            requires_confirmation=preparation.requires_confirmation,
+            plan_digest=preparation.plan_digest,
+            summary=self._summary(preparation),
+            mapping_request=self._mapping_request(preparation),
+            payload=preparation,
+        )
+
+    def prepare(self, path: str | Path) -> PreparedTemplate:
+        try:
+            return self._wrap(prepare_scientific(path, self.manifest.id))
+        except ScientificWorkflowError as exc:
+            raise TemplateServiceError(exc.code, str(exc)) from exc
+
+    def confirm_mapping(
+        self,
+        prepared: PreparedTemplate,
+        *,
+        assignments: dict[str, str],
+        energy_kind: str,
+    ) -> PreparedTemplate:
+        if set(assignments) != set(prepared.source_columns):
+            raise TemplateServiceError(
+                "mapping_incomplete", "Every source column must be assigned a role or ignored."
+            )
+        mapping = ScientificColumnMapping(
+            assignments=tuple((column, assignments[column]) for column in prepared.source_columns),
+            plot_mode=energy_kind or None,
+        )
+        try:
+            return self._wrap(
+                prepare_scientific(
+                    prepared.source_path,
+                    self.manifest.id,
+                    column_mapping=mapping,
+                )
+            )
+        except ScientificWorkflowError as exc:
+            raise TemplateServiceError(exc.code, str(exc)) from exc
+
+    def render_preview(self, prepared: PreparedTemplate) -> bytes:
+        if prepared.requires_confirmation:
+            raise TemplateConfirmationRequired()
+        try:
+            return render_scientific_preview_png(prepared.payload)
+        except ScientificPreviewError as exc:
+            raise TemplateServiceError(exc.code, str(exc)) from exc
+
+    @staticmethod
+    def worker_mapping(prepared: PreparedTemplate) -> dict[str, object] | None:
+        preparation: ScientificPreparation = prepared.payload
+        if not preparation.mapping_confirmed:
+            return None
+        return ScientificColumnMapping(
+            assignments=preparation.assignments,
+            plot_mode=preparation.plot_spec.plot_mode,
+        ).to_dict()
+
+
+class TemplateServiceRegistry:
+    """Build workflow services from public template manifests."""
+
+    def __init__(self, registry: TemplateRegistry | None = None) -> None:
+        self.registry = registry or TemplateRegistry()
+        self._services: dict[str, Any] = {}
+        for manifest in self.registry.implemented():
+            service_path = manifest.service_path
+            if service_path is None or not service_path.is_file():
+                raise TemplateServiceError(
+                    "workflow_unavailable",
+                    f"No local workflow service is registered for {manifest.id}.",
+                )
+            spec = importlib.util.spec_from_file_location(
+                f"origin_sciplot_template_service_{manifest.id}", service_path
+            )
+            if spec is None or spec.loader is None:
+                raise TemplateServiceError(
+                    "workflow_load_error", f"Could not load workflow service for {manifest.id}."
+                )
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            factory = getattr(module, "create_service", None)
+            if not callable(factory):
+                raise TemplateServiceError(
+                    "workflow_factory_missing",
+                    f"Template service {service_path.name} must define create_service().",
+                )
+            self._services[manifest.id] = factory(manifest)
+
+    def implemented(self) -> list[Any]:
+        return list(self._services.values())
+
+    def get(self, template_id: str) -> Any:
+        try:
+            return self._services[template_id]
+        except KeyError as exc:
+            raise TemplateServiceError("template_unknown", f"Unknown public template: {template_id}") from exc
+
+
+__all__ = [
+    "ColumnMappingRequest",
+    "MappingRoleOption",
+    "PreparedTemplate",
+    "ScientificTemplateService",
+    "TemplateConfirmationRequired",
+    "TemplateServiceError",
+    "TemplateServiceRegistry",
+    "TemplateSummary",
+    "XpsTemplateService",
+]

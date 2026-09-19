@@ -1,0 +1,102 @@
+# 发布、隐私与许可边界
+
+> 本页记录 EditaPlot 自 2026-07-21 首次开源以来的当前公开边界与长期约束，不构成法律意见。
+
+## 公开版是完整产品
+
+公开仓库包含完整 Codex Skill、清理后的自包含 runtime、模板、确定性 CLI、测试、双语文档、
+中性合成示例、原创配色，以及覆盖 40 条公开绘图路线的 47 个 Origin 验证 PNG。公开页面从中
+展示 45 个案例；另外两个热力图 PNG 只保留作回归与审计历史。公开版不是功能受限版，也没有
+隐藏的“私人高级模板”。
+
+“模板已实现”“验证资产已保留”和“案例已进入公开 gallery”是三个独立状态。新增模板可以随源码发布，
+但示例图只有完成 Origin 全格式产物、对象反读、人工视觉检查、脱敏和 provenance 审计后，
+才能进入验证资产清单；只有被标记为展示的验证资产才会出现在页面。没有通过门禁的预览不会
+进入首页或资产清单。
+
+本地私有层只保留不适合随源码传播的开发与验证证据，例如用户数据、绝对路径、开发日志、OPJU/PDF/TIF、RenderPlan 和对象反读报告。它们用于复核，不构成另一套产品能力。
+
+| 公开 GitHub 仓库 | 开发者或用户本地 |
+|---|---|
+| Apache-2.0 项目源码与完整 Skill | `DEVELOPMENT_LEDGER.md`、内部计划、开发日志 |
+| 清理后的 runtime、模板与依赖锁 | `.build-venv`、缓存、临时输出、EXE/安装包 |
+| 中性合成 CSV 与原创视觉资产 | 用户原始数据、参考截图、未获许可的材料 |
+| 复核并清理元数据的 PNG | OPJU/PDF/TIF、RenderPlan、readback、verification JSON |
+| 测试、provenance 与 SHA-256 清单 | 本机绝对路径、凭据、token、证书与 `.env` |
+
+OPJU/PDF/TIF 若以后作为 Release 附件公开，必须另行确认再分发权、元数据脱敏、文件体积和来源清单；它们不会直接进入源码历史。
+
+用户上传的参考图也不会进入公开仓库或正式 Origin 产物。参考图适配只在本机保存图片哈希和经过
+确认的图形语法；不从像素提取实验数值，不复制文字、拟合、物相、Logo 或水印，也不把参考位图
+嵌入 OPJU。公开 gallery 仍只收录来源清晰、已经清理元数据并通过资产审计的项目自有示例。
+
+## 当前材料、高密度热力图与网络图边界
+
+- XPS 多谱线对比、FTIR/IR、NMR、DSC、PL 多条件、UV–Vis 多样品和 30×30 高密度
+  热力图已在 2024b 基线上生成 OPJU/PNG/PDF/TIF，并通过程序化对象反读、绑定 PNG
+  哈希的人工视觉 QA 与公开 PNG 脱敏审计。
+- 公开页面只展示真实 30×30 高密度热力图。小型数值标注热力图和 40×40 热力图继续
+  保留在 47 个验证资产中，用于回归与审计，不作为额外展示案例。
+- 多面板环形有向加权网络已经在同一 2024b 基线上生成可编辑 OPJU 与 PNG/PDF/TIF；
+  对象反读确认共享节点位置、有向箭头、统一权重线宽、正负颜色和无框图例，人工视觉 QA
+  绑定最终 PNG 哈希。该路线只呈现数据或确认中已有的节点、方向、正负与权重，不推断因果、
+  相关、中心性或缺失关系。
+- 三维双密度曲线与基线焦点路线已经在同一 2024b 基线上完成 OPJU、PNG/PDF/TIF、OpenGL
+  3D 对象反读和人工视觉 QA。公开示例只使用项目原创合成 mixed-wide 数据；两条密度曲线与
+  每组一个 `Focal X` 均来自源表，焦点只作为 Z=0 基线 locator，不推断 KDE、峰、交点或阈值。
+- 任何案例都不得为了增加数量而跳过门禁；本机绝对路径、开发日志、用户数据和未清理的
+  中间图不得进入公开仓库。
+
+## 默认拒绝式公开白名单
+
+`release/public-release-policy.json` 定义唯一公开文件集合，`tools/verify_public_release.py` 在发布前和 CI 中强制检查：
+
+1. Git 索引与工作树一致，防止检查安全文件却提交旧内容；
+2. 跟踪文件全部命中白名单，禁止子模块、符号链接、LFS 指针和高风险扩展名；
+3. 扫描绝对路径、旧品牌、常见密钥/token 形式、私人邮箱和禁止文件名；
+4. 校验 Apache-2.0 正文、NOTICE、精确依赖锁与 runtime SHA-256 manifest；
+5. 校验公开资产 provenance、生成器绑定、人工审核记录和 gallery 精确集合；
+6. 解析 PNG chunk、CRC、结尾、EXIF 与压缩文本，拒绝尾随载荷和敏感元数据；
+7. 限制单文件与仓库体积，并拒绝日志、缓存、环境目录和未审查输出。
+
+因此，旧 GitHub 历史、私人作者邮箱和早期品牌也不会成为公开分支的祖先；首次公开分支从经过审核的单一根提交开始。
+
+## 已确定的开源路线
+
+- 主品牌、仓库名与 Skill ID：`EditaPlot` / `editaplot`，不把第三方商标作为产品品牌。
+- 项目自有代码、文档、合成数据与原创资产：Apache-2.0。
+- 完整 Skill 与清理后的 runtime 一并公开；不捆绑第三方应用或 Python wheel。
+- 软件可免费使用、修改和再分发。维护者可另行提供咨询、定制、安装协助和支持，但这些服务不削减 Apache-2.0 权利，也不代客户运行托管或远程自动化。
+
+## Origin 技术兼容边界
+
+- 只调用用户电脑上已经安装的 Origin/OriginPro；默认自动启动 EditaPlot 独占的本机实例，
+  不要求用户预先打开窗口，也不分发 Origin 应用。用户已经打开的交互窗口不是默认连接目标。
+- 不把 Origin Automation Server 暴露到公共网络，不提供云端绘图或 service-bureau 服务。
+- “兼容 Origin”只描述互操作性，不表示 OriginLab 认可、赞助或提供本项目。
+- 环境自动修复只安装项目级 Python 依赖，不安装或修改 Origin；Doctor 只读发现，真实 smoke
+  仅在用户请求绘图时启动专用实例并验证本机 Automation。
+- 普通 render 不指定 `--output-dir`：正式结果保存在源 CSV/TXT/XLS/XLSX 所在目录中新建的
+  `<source_stem>_EditaPlot_<timestamp>` 同级文件夹。只有用户明确要求时才能改用其他位置。
+
+OriginLab 的 [External Python 文档](https://docs.originlab.com/externalpython/)说明了本机 Windows、
+Origin 版本和 Automation 的技术要求。EditaPlot 当前以 Origin/OriginPro 2021–2026b 为兼容
+目标，2020b 及更早版本不在当前外部路线支持范围；端到端完整验证基线仍是 2024b（10.15），
+也是目前唯一可称为完整实机基线的版本。其他目标版本先按本机握手、真实 smoke 和模板能力报告，
+只有生成完整可编辑产物、对象反读和视觉 QA 后才标记为已验证。
+
+不得把“检测到安装”“可以启动”或“Automation 握手成功”单独写成版本兼容成功。对
+2021–2026b 中尚未完成全量实机验收的版本，结果应写成检测到的版本、已通过的阶段、当前模板
+能力和下一步，而不是笼统承诺全部模板可用。
+
+当前项目采用中性品牌，只做本机互操作，不分发第三方应用，也不提供远程或云端 Automation 服务。若以后改为代算、托管、多租户或远程 Automation Server，必须重新审计技术架构、安全、隐私和第三方分发边界。
+
+公共仓库产生的 fork 或本地副本无法通过改回 private 收回。参见 [GitHub 许可说明](https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/licensing-a-repository)与[可见性变更说明](https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/managing-repository-settings/setting-repository-visibility)。
+
+## 后续发行门禁
+
+1. 每次 release 重新扫描密钥、绝对路径、PHI、日志、缓存和禁止扩展名；
+2. 更新精确依赖锁、依赖许可证清单、资产 provenance 和 runtime SHA-256 manifest；
+3. 新 Origin 路线先查官方文档并隔离验证，再完成 OPJU、PNG/PDF/TIF、对象反读与视觉 QA；
+4. 若分发含 PySide6/Qt DLL 的 EXE 或安装包，先完成 LGPLv3 全部义务或取得 Qt 商业许可；
+5. 若商业模式、远程边界或品牌发生变化，重新执行第三方分发边界与商标审计。

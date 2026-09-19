@@ -1,0 +1,4183 @@
+"""Deterministic inspection, recommendation, planning, and verification for EditaPlot."""
+
+from __future__ import annotations
+
+import hashlib
+import importlib.util
+import json
+import math
+import os
+import platform
+import re
+import shutil
+import struct
+import subprocess
+import sys
+import unicodedata
+from collections.abc import Iterable, Iterator
+from contextlib import contextmanager
+from dataclasses import asdict, is_dataclass
+from pathlib import Path
+from typing import Any, BinaryIO
+
+try:
+    from importlib import metadata as importlib_metadata
+except ImportError:  # pragma: no cover - supported runtime is CPython 3.10-3.12
+    try:
+        import importlib_metadata  # type: ignore[no-redef]
+    except ImportError:  # pragma: no cover - lets doctor explain unsupported legacy Python
+        importlib_metadata = None  # type: ignore[assignment]
+
+
+PLAN_VERSION = "1.3"
+MEDICAL_PANEL_PLAN_VERSION = "1.0"
+AUTO_SCORE_THRESHOLD = 0.84
+AUTO_MARGIN_THRESHOLD = 0.13
+MANAGED_ENV_DIRECTORY = ".editaplot-venv"
+MANAGED_ENV_FINGERPRINT = ".editaplot-environment.json"
+MANAGED_ENV_BUILD_PREFIX = f"{MANAGED_ENV_DIRECTORY}.build-"
+MANAGED_ENV_STALE_PREFIX = f"{MANAGED_ENV_DIRECTORY}.stale-"
+MANAGED_ENV_LOCK = ".editaplot-environment.lock"
+PYTHON_MIN_VERSION = (3, 10)
+PYTHON_MAX_VERSION_EXCLUSIVE = (3, 13)
+PYTHON_REQUIRED_BITS = 64
+RUNTIME_DEPENDENCIES = (
+    ("numpy", "numpy==1.26.4"),
+    ("pandas", "pandas==2.3.3"),
+    ("yaml", "PyYAML==6.0.3"),
+    ("jsonschema", "jsonschema==4.26.0"),
+    ("matplotlib", "matplotlib==3.10.9"),
+    ("originpro", "originpro==1.1.15"),
+    ("OriginExt", "OriginExt==1.2.5"),
+    ("openpyxl", "openpyxl==3.1.5"),
+    ("xlrd", "xlrd==2.0.2"),
+    ("PIL", "pillow==12.3.0"),
+)
+VERIFIED_TEMPLATE_IDS = frozenset(
+    {
+        "xps",
+        "eis",
+        "cv",
+        "lsv",
+        "xas",
+        "xrd",
+        "bar",
+        "horizontal_bar",
+        "stacked_bar",
+        "percent_stacked_bar",
+        "pie",
+        "sankey",
+        "circular_network",
+        "scatter",
+        "line_error",
+        "trend",
+        "radar",
+        "heatmap",
+        "raw_summary",
+        "violin",
+        "histogram",
+        "forest",
+        "bubble",
+        "diagnostic_curve",
+        "confusion_matrix",
+        "bland_altman",
+        "paired_trajectory",
+        "calibration_curve",
+        "decision_curve",
+        "raincloud",
+        "shap_summary",
+        "shap_dashboard",
+        "grouped_box",
+        "pl",
+        "dsc",
+        "nmr",
+        "ftir",
+        "xps_compare",
+        "uv_vis",
+        "trajectory3d",
+        "density_ridgeline3d",
+    }
+)
+
+
+class EditaPlotError(RuntimeError):
+    """Stable, JSON-friendly EditaPlot failure."""
+
+    def __init__(self, code: str, message: str, **details: Any) -> None:
+        super().__init__(message)
+        self.code = code
+        self.details = details
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"ok": False, "error": {"code": self.code, "message": str(self), **self.details}}
+
+
+def _canonical(value: object) -> str:
+    text = unicodedata.normalize("NFKC", str(value)).strip().casefold()
+    return re.sub(r"[^0-9a-z\u4e00-\u9fffμθ]+", "", text)
+
+
+def _trajectory3d_semantic_axis_header(column: str) -> bool:
+    match = re.search(r"[\(\[]\s*([^\)\]]+)\s*[\)\]]\s*$", column)
+    if match is None or not match.group(1).strip():
+        return False
+    meaning = column[: match.start()].strip(" _-/")
+    return bool(meaning) and _canonical(meaning) not in {
+        "x",
+        "y",
+        "z",
+        "index",
+        "condition",
+        "value",
+        "variable",
+        "序号",
+        "条件",
+        "数值",
+    }
+
+
+def _explicit_negative_zimag_header(column: str) -> bool:
+    text = unicodedata.normalize("NFKC", column).casefold().replace("−", "-")
+    compact = re.sub(r"\s+", "", text)
+    return (
+        compact.startswith("-z")
+        or "negativezimag" in compact
+        or "minuszimag" in compact
+        or "负阻抗虚部" in compact
+        or "负虚部" in compact
+    )
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def windows_host_compatibility(
+    *,
+    system: str | None = None,
+    machine: str | None = None,
+    windows_major: int | None = None,
+) -> dict[str, Any]:
+    """Return the enforceable portion of the Windows 10/11 x64 support contract."""
+
+    selected_system = system or platform.system()
+    selected_machine = machine or platform.machine()
+    selected_major = windows_major
+    if selected_system == "Windows" and selected_major is None:
+        try:
+            selected_major = int(sys.getwindowsversion().major)
+        except (AttributeError, OSError, ValueError):
+            selected_major = None
+    normalized_machine = selected_machine.strip().casefold()
+    reasons: list[str] = []
+    if selected_system != "Windows":
+        reasons.append("windows_required")
+    else:
+        if normalized_machine not in {"amd64", "x86_64"}:
+            reasons.append("windows_x64_amd64_required")
+        if selected_major is None:
+            reasons.append("windows_version_unknown")
+        elif selected_major < 10:
+            reasons.append("windows_10_or_newer_required")
+    return {
+        "compatible": not reasons,
+        "system": selected_system,
+        "machine": selected_machine,
+        "windows_major": selected_major,
+        "required": "physical Windows 10/11 x64 (AMD64/x86_64)",
+        "virtual_machine_detection_performed": False,
+        "reasons": reasons,
+    }
+
+
+def python_compatibility(
+    *,
+    version: tuple[int, ...] | None = None,
+    implementation: str | None = None,
+    architecture_bits: int | None = None,
+    system: str | None = None,
+    machine: str | None = None,
+    windows_major: int | None = None,
+) -> dict[str, Any]:
+    """Return the single compatibility decision used by doctor, repair, and bootstrap.
+
+    EditaPlot deliberately selects only the interpreter range covered by the
+    audited Windows dependency lock.  A numerically newer interpreter is not
+    automatically safer when a compiled dependency has no matching wheel.
+    """
+
+    selected_version = tuple(version or tuple(sys.version_info[:3]))
+    selected_implementation = implementation or platform.python_implementation()
+    selected_bits = architecture_bits or struct.calcsize("P") * 8
+    host = windows_host_compatibility(
+        system=system,
+        machine=machine,
+        windows_major=windows_major,
+    )
+    reasons: list[str] = []
+    if selected_implementation != "CPython":
+        reasons.append("cpython_required")
+    if selected_bits != PYTHON_REQUIRED_BITS:
+        reasons.append("64_bit_python_required")
+    if selected_version[:2] < PYTHON_MIN_VERSION:
+        reasons.append("python_too_old")
+    if selected_version[:2] >= PYTHON_MAX_VERSION_EXCLUSIVE:
+        reasons.append("python_not_yet_verified")
+    reasons.extend(host["reasons"])
+    return {
+        "compatible": not reasons,
+        "implementation": selected_implementation,
+        "version": ".".join(str(part) for part in selected_version[:3]),
+        "version_info": list(selected_version[:3]),
+        "architecture_bits": selected_bits,
+        "required": "64-bit CPython >=3.10,<3.13",
+        "host": host,
+        "reasons": reasons,
+    }
+
+
+def _dependency_policy_hash() -> str:
+    payload = {"dependencies": [spec for _module, spec in RUNTIME_DEPENDENCIES]}
+    return _json_hash(payload)
+
+
+def _json_hash(payload: dict[str, Any]) -> str:
+    data = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(data.encode("utf-8")).hexdigest()
+
+
+def _engine_marker(path: Path) -> bool:
+    return (
+        (path / "src" / "origin_sciplot" / "__init__.py").is_file()
+        and (path / "templates").is_dir()
+        and (path / "src" / "origin_sciplot" / "workers" / "run_template_worker.py").is_file()
+    )
+
+
+def resolve_engine_home(value: str | Path | None = None) -> Path:
+    """Resolve an unpacked EditaPlot engine without a private hard-coded path."""
+    candidates: list[Path] = []
+    if value:
+        candidates.append(Path(value))
+    env_value = os.environ.get("EDITAPLOT_ENGINE_HOME")
+    if env_value:
+        candidates.append(Path(env_value))
+
+    starts = [Path.cwd(), Path(__file__).resolve().parent]
+    for start in starts:
+        for parent in (start, *start.parents):
+            candidates.extend((parent, parent / "xps-origin-template-mvp", parent / "runtime"))
+
+    seen: set[Path] = set()
+    for candidate in candidates:
+        try:
+            resolved = candidate.expanduser().resolve()
+        except OSError:
+            continue
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        if _engine_marker(resolved):
+            return resolved
+    raise EditaPlotError(
+        "engine_not_found",
+        "EditaPlot could not locate the rendering engine. Pass --engine-home or set EDITAPLOT_ENGINE_HOME.",
+    )
+
+
+def bootstrap_engine(value: str | Path | None = None) -> Path:
+    root = resolve_engine_home(value)
+    source = str(root / "src")
+    if source not in sys.path:
+        sys.path.insert(0, source)
+    root_text = str(root)
+    if root_text not in sys.path:
+        sys.path.insert(0, root_text)
+    return root
+
+
+_SEMANTIC_ALIASES: dict[str, tuple[str, ...]] = {
+    "xps_energy": ("bindingenergy", "kineticenergy", "结合能", "动能"),
+    "raw": ("raw", "counts", "intensity", "强度", "计数", "原始"),
+    "background": ("background", "baseline", "背景", "基线"),
+    "envelope": ("envelope", "fitsum", "fittotal", "拟合包络", "总拟合"),
+    "residual": ("residual", "resid", "difference", "残差", "差值"),
+    "xrd_angle": ("2theta", "twotheta", "2θ", "衍射角"),
+    "absorption": ("absorption", "mu", "μ", "xanes", "exafs", "吸收"),
+    "wavelength": ("wavelength", "lambda", "波长"),
+    "uv_signal": ("absorbance", "transmittance", "transmission", "吸光度", "透过率", "透射率"),
+    "pl_signal": (
+        "plintensity",
+        "normalizedpl",
+        "plsignal",
+        "plcounts",
+        "photoluminescence",
+        "emissionintensity",
+        "发光强度",
+        "荧光强度",
+        "光致发光",
+    ),
+    "time": ("time", "decaytime", "时间", "衰减时间"),
+    "temperature": (
+        "temperature",
+        "sampletemperature",
+        "temp",
+        "温度",
+        "样品温度",
+    ),
+    "heat_flow": (
+        "heatflow",
+        "heatflux",
+        "dscsignal",
+        "热流",
+        "热流率",
+        "差示扫描量热",
+    ),
+    "chemical_shift": (
+        "chemicalshift",
+        "shiftppm",
+        "nmrshift",
+        "化学位移",
+    ),
+    "nmr_signal": (
+        "nmrintensity",
+        "nmrsignal",
+        "nmr",
+        "核磁强度",
+        "核磁信号",
+    ),
+    "wavenumber": (
+        "wavenumber",
+        "wave number",
+        "ramanshift",
+        "波数",
+    ),
+    "ir_signal": (
+        "transmittance",
+        "transmission",
+        "absorbance",
+        "absorption",
+        "ftir",
+        "irsignal",
+        "透过率",
+        "透射率",
+        "吸光度",
+        "红外强度",
+    ),
+    "fit": ("fit", "fitted", "fitting", "拟合"),
+    "photon_energy": ("photonenergy", "hnu", "hv", "光子能量"),
+    "tauc": ("taucvalue", "tauc", "tauc值"),
+    "bandgap": ("bandgap", "energygap", "eg", "带隙", "禁带宽度"),
+    "frequency": ("frequency", "freq", "hz", "频率"),
+    "z_real": ("zreal", "rez", "zre", "阻抗实部"),
+    "z_imag": ("zimag", "imz", "zim", "阻抗虚部"),
+    "phase": ("phase", "相位", "相位角"),
+    "potential": ("potential", "voltage", "电位", "电压"),
+    "current": ("current", "currentdensity", "电流", "电流密度"),
+    "category": ("category", "group", "sample", "label", "类别", "组别", "样品", "标签"),
+    "metric": ("metric", "indicator", "dimension", "指标", "维度"),
+    "matrix_row": ("dataset", "cohort", "数据集", "队列"),
+    "error": ("sd", "sem", "se", "stderr", "error", "标准差", "标准误", "误差"),
+    "source": ("source", "from", "来源", "起点", "源"),
+    "target": ("target", "to", "目标", "终点"),
+    "value": ("value", "weight", "flow", "数值", "权重", "流量"),
+    "panel": (
+        "panel",
+        "period",
+        "timeperiod",
+        "stage",
+        "facet",
+        "面板",
+        "时期",
+        "时段",
+        "阶段",
+        "分面",
+    ),
+    "sign": (
+        "sign",
+        "relationsign",
+        "edgetype",
+        "effectdirection",
+        "符号",
+        "关系符号",
+        "边类型",
+        "效应方向",
+        "正负",
+    ),
+    "source_group": (
+        "sourcegroup",
+        "fromgroup",
+        "来源组",
+        "起点组",
+        "源节点组",
+    ),
+    "target_group": (
+        "targetgroup",
+        "togroup",
+        "目标组",
+        "终点组",
+        "目标节点组",
+    ),
+    "edge_label": (
+        "edgelabel",
+        "relationlabel",
+        "linklabel",
+        "边标签",
+        "关系标签",
+        "连线标签",
+    ),
+    "size": (
+        "size",
+        "magnitude",
+        "abundance",
+        "count",
+        "samplesize",
+        "大小",
+        "规模",
+        "丰度",
+        "数量",
+        "样本量",
+    ),
+    "estimate": ("estimate", "effect", "difference", "coefficient", "估计", "效应", "差异", "系数"),
+    "lower": ("cilow", "lowerci", "lower", "lcl", "置信下限", "下限"),
+    "upper": ("cihigh", "upperci", "upper", "ucl", "置信上限", "上限"),
+    "reference": ("reference", "null", "baseline", "参考值", "零效应", "基准"),
+    "diagnostic_x": ("fpr", "falsepositiverate", "recall", "sensitivity", "假阳性率", "召回率", "敏感度"),
+    "prevalence": ("prevalence", "患病率", "阳性率基线"),
+    "predicted_probability": ("predictedprobability", "predictedrisk", "预测概率", "预测风险"),
+    "observed_fraction": ("observedfraction", "eventrate", "observedrisk", "观察比例", "实际发生率"),
+    "bin_count": ("bincount", "分箱样本数", "频数"),
+    "threshold": ("threshold", "thresholdprobability", "阈值", "阈值概率"),
+    "treat_all": ("treatall", "全部干预", "全部治疗"),
+    "treat_none": ("treatnone", "不干预", "不治疗"),
+    "actual_class": ("actualclass", "trueclass", "实际类别", "真实类别"),
+    "pair_mean": ("pairmean", "mean", "average", "配对均值", "均值", "平均值"),
+    "difference": ("difference", "methoddifference", "差值", "方法差"),
+    "bias": ("bias", "meandifference", "偏倚", "平均差"),
+    "loa_lower": ("lowerloa", "lowerlimitofagreement", "一致性下限"),
+    "loa_upper": ("upperloa", "upperlimitofagreement", "一致性上限"),
+    "visit": ("visit", "conditionindex", "访视", "条件序号"),
+    "feature": ("feature", "featurename", "variable", "predictor", "特征", "特征名", "变量", "预测因子"),
+    "shap_value": ("shapvalue", "shap", "shap值", "特征贡献", "贡献值"),
+    "feature_value": ("featurevalue", "rawfeaturevalue", "特征值", "原始特征值"),
+    "shap_sample_id": ("sampleid", "caseid", "patientid", "样本编号", "样本id", "病例编号"),
+    "shap_feature_order": ("featureorder", "displayorder", "特征顺序", "显示顺序", "特征排序"),
+    "shap_mean_abs": (
+        "meanabsoluteshap",
+        "meanabsshap",
+        "mean|shap|",
+        "平均绝对shap",
+        "平均绝对shap值",
+        "平均绝对贡献",
+    ),
+    "shap_feature_group": ("featuregroup", "featuredomain", "特征组", "指标类别", "特征领域"),
+    "shap_group_contribution": (
+        "groupcontribution",
+        "groupcontributionpercent",
+        "grouppercent",
+        "组贡献百分比",
+        "分组贡献",
+        "组占比",
+    ),
+    "series_id": ("series", "seriesid", "sampleid", "conditionname", "系列", "样品编号", "组别"),
+    "condition_id": (
+        "conditionid",
+        "conditionname",
+        "conditionlabel",
+        "条件标识",
+        "条件编号",
+        "条件名称",
+    ),
+    "density_x": (
+        "densityx",
+        "responsescore",
+        "distributionscore",
+        "metricvalue",
+        "分布横轴",
+        "响应评分",
+        "指标值",
+    ),
+    "condition_position": (
+        "conditionposition",
+        "conditionaxis",
+        "orderedcondition",
+        "year",
+        "followuptime",
+        "timepoint",
+        "条件位置",
+        "条件轴",
+        "有序条件",
+        "年份",
+        "年度",
+        "随访时间",
+        "时间点",
+    ),
+    "density_solid": (
+        "soliddensity",
+        "solidprofiledensity",
+        "实线密度",
+        "实线轮廓密度",
+    ),
+    "density_dashed": (
+        "dasheddensity",
+        "dashedprofiledensity",
+        "虚线密度",
+        "虚线轮廓密度",
+    ),
+    "focal_x": (
+        "focalx",
+        "focalpoint",
+        "focusx",
+        "focuspoint",
+        "baselinefocus",
+        "locatorx",
+        "焦点横坐标",
+        "基线焦点",
+        "定位点",
+    ),
+}
+
+
+def _semantic_tags(column: str) -> list[str]:
+    canonical = _canonical(column)
+    tags: list[str] = []
+    for tag, aliases in _SEMANTIC_ALIASES.items():
+        matched = False
+        for alias in aliases:
+            canonical_alias = _canonical(alias)
+            if canonical_alias.isascii() and canonical_alias.isalnum() and len(canonical_alias) <= 2:
+                normalized_column = unicodedata.normalize("NFKC", column).casefold()
+                matched = bool(
+                    re.search(
+                        rf"(?<![0-9a-z]){re.escape(str(alias).casefold())}(?![0-9a-z])",
+                        normalized_column,
+                    )
+                )
+            else:
+                matched = canonical_alias in canonical
+            if matched:
+                break
+        if matched:
+            tags.append(tag)
+    # Prefer the more specific circular-network roles over substring matches.
+    # For example, ``SourceGroup`` must not count as the required ``Source``
+    # endpoint and ``EdgeLabel`` is metadata, not a category column.
+    if "source_group" in tags:
+        tags = [tag for tag in tags if tag not in {"source", "category"}]
+    if "target_group" in tags:
+        tags = [tag for tag in tags if tag not in {"target", "category"}]
+    if "edge_label" in tags:
+        tags = [tag for tag in tags if tag != "category"]
+    if "panel" in tags:
+        tags = [tag for tag in tags if tag != "time"]
+    if "condition_id" in tags:
+        tags = [tag for tag in tags if tag not in {"series_id", "category"}]
+    if "focal_x" in tags:
+        tags = [tag for tag in tags if tag != "density_x"]
+    return tags
+
+
+def _finite_float(value: Any) -> float | None:
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return None
+    return result if math.isfinite(result) else None
+
+
+def inspect_data(path: str | Path, *, engine_home: str | Path | None = None) -> dict[str, Any]:
+    """Read a scientific table through the engine's immutable loader and profile its shape."""
+    root = bootstrap_engine(engine_home)
+    try:
+        import numpy as np
+        import pandas as pd
+        from origin_sciplot.data_loader import DataLoadError, load_table
+        from origin_sciplot.scientific_workflow import density_ridgeline3d_contract_issues
+    except Exception as exc:  # noqa: BLE001
+        raise EditaPlotError("engine_import_failed", f"Could not import the engine: {exc}") from exc
+
+    try:
+        loaded = load_table(path)
+    except DataLoadError as exc:
+        raise EditaPlotError(exc.code, str(exc), column=exc.column, row=exc.row) from exc
+
+    profiles: list[dict[str, Any]] = []
+    numeric_columns: list[str] = []
+    categorical_columns: list[str] = []
+    all_nonnegative = True
+    max_label_length = 0
+    first_category_unique = 0
+
+    for index, column in enumerate(loaded.columns):
+        series = loaded.frame[column]
+        as_text = series.astype("string").str.strip()
+        nonempty_mask = as_text.notna() & as_text.ne("")
+        nonempty_count = int(nonempty_mask.sum())
+        missing_count = int(len(series) - nonempty_count)
+        numeric = pd.to_numeric(series.where(nonempty_mask), errors="coerce")
+        numeric_array = numeric.to_numpy(dtype=float, na_value=np.nan)
+        finite_mask = np.isfinite(numeric_array)
+        numeric_count = int(finite_mask.sum())
+        numeric_ratio = numeric_count / nonempty_count if nonempty_count else 0.0
+        kind = "numeric" if nonempty_count and numeric_ratio >= 0.8 else "categorical"
+        tags = _semantic_tags(column)
+        profile: dict[str, Any] = {
+            "name": column,
+            "index": index,
+            "kind": kind,
+            "semantic_tags": tags,
+            "nonempty_count": nonempty_count,
+            "missing_count": missing_count,
+            "numeric_ratio": round(numeric_ratio, 4),
+            "unique_count": int(as_text[nonempty_mask].nunique(dropna=True)),
+        }
+        if kind == "numeric":
+            numeric_columns.append(column)
+            values = numeric_array[finite_mask]
+            if values.size:
+                diffs = np.diff(values)
+                nonzero_signs = np.sign(diffs[np.abs(diffs) > 1e-12])
+                direction_changes = (
+                    int(np.sum(nonzero_signs[1:] != nonzero_signs[:-1])) if nonzero_signs.size > 1 else 0
+                )
+                minimum = float(np.min(values))
+                maximum = float(np.max(values))
+                all_nonnegative = all_nonnegative and minimum >= 0
+                profile.update(
+                    {
+                        "minimum": minimum,
+                        "maximum": maximum,
+                        "monotonic_increasing": bool(np.all(diffs >= 0)),
+                        "monotonic_decreasing": bool(np.all(diffs <= 0)),
+                        "direction_changes": direction_changes,
+                    }
+                )
+        else:
+            categorical_columns.append(column)
+            lengths = as_text[nonempty_mask].str.len()
+            longest = int(lengths.max()) if not lengths.empty else 0
+            max_label_length = max(max_label_length, longest)
+            profile["maximum_label_length"] = longest
+            if index == 0:
+                first_category_unique = profile["unique_count"]
+        profiles.append(profile)
+
+    tags = {tag for profile in profiles for tag in profile["semantic_tags"]}
+    layouts: list[str] = []
+    if {"source", "target", "value"}.issubset(tags):
+        layouts.append("edge_list")
+        if "panel" in tags:
+            layouts.append("temporal_edge_list")
+    if profiles and profiles[0]["kind"] == "categorical" and numeric_columns:
+        layouts.append("category_wide")
+        if len(numeric_columns) >= 2:
+            layouts.append("matrix_candidate")
+    if len(numeric_columns) >= 2:
+        layouts.append("numeric_xy")
+    if "error" in tags:
+        layouts.append("error_wide")
+    if numeric_columns and not categorical_columns:
+        layouts.append("numeric_wide")
+        if len(numeric_columns) == 1:
+            layouts.append("numeric_univariate")
+    grouped_headers = [
+        profile["name"] for profile in profiles if "|" in str(profile["name"]) or "｜" in str(profile["name"])
+    ]
+    if len(grouped_headers) >= 4 and len(grouped_headers) == len(numeric_columns):
+        layouts.append("grouped_box_wide")
+    if {"wavelength", "uv_signal"}.issubset(tags):
+        layouts.append("uv_vis_wide")
+    if "pl_signal" in tags and ("wavelength" in tags or "time" in tags):
+        layouts.append("pl_wide")
+        if "time" in tags or "fit" in tags:
+            layouts.append("trpl_wide")
+    if {"temperature", "heat_flow"}.issubset(tags):
+        layouts.append("dsc_wide")
+    if "chemical_shift" in tags and len(numeric_columns) >= 2:
+        layouts.append("nmr_wide")
+    if {"wavenumber", "ir_signal"}.issubset(tags):
+        layouts.append("ftir_wide")
+    if "xps_energy" in tags and len(numeric_columns) >= 3:
+        layouts.append("xps_compare_wide")
+    if {"estimate", "lower", "upper"}.issubset(tags) and categorical_columns:
+        layouts.append("interval_table")
+    if "size" in tags and len(numeric_columns) >= 3:
+        layouts.append("indexed_size")
+    if "diagnostic_x" in tags and len(numeric_columns) >= 2:
+        layouts.append("diagnostic_coordinates")
+    if {"predicted_probability", "observed_fraction", "bin_count"}.issubset(tags):
+        layouts.append("calibration_bins")
+    if {"threshold", "treat_all", "treat_none"}.issubset(tags) and len(numeric_columns) >= 4:
+        layouts.append("decision_net_benefit")
+    if "actual_class" in tags and "matrix_candidate" in layouts:
+        layouts.append("confusion_matrix")
+    if {"pair_mean", "difference", "bias", "loa_lower", "loa_upper"}.issubset(tags):
+        layouts.append("bland_altman_limits")
+    if "visit" in tags and len(numeric_columns) >= 3:
+        layouts.append("paired_wide")
+    if {"feature", "shap_value", "feature_value"}.issubset(tags) and categorical_columns:
+        layouts.append("shap_long")
+        if "shap_mean_abs" in tags:
+            layouts.append("shap_mean_abs_long")
+        if "shap_feature_group" in tags:
+            layouts.append("shap_grouped_composite_long")
+    density_required_roles = (
+        "condition_id",
+        "condition_position",
+        "density_x",
+        "density_solid",
+        "density_dashed",
+        "focal_x",
+    )
+    density_role_candidates = {
+        role: [profile for profile in profiles if role in profile["semantic_tags"]]
+        for role in density_required_roles
+    }
+    density_roles_detected = sum(bool(items) for items in density_role_candidates.values())
+    density_candidate = density_roles_detected == len(density_required_roles)
+    density_issues: list[str] = []
+    density_role_columns: dict[str, str] = {}
+    density_strict = False
+    if density_candidate:
+        layouts.append("density_ridgeline3d_candidate")
+        for role, candidates in density_role_candidates.items():
+            if len(candidates) != 1:
+                density_issues.append(f"{role}_role_not_unique")
+            else:
+                density_role_columns[role] = str(candidates[0]["name"])
+
+        if not density_issues:
+            density_issues.extend(
+                density_ridgeline3d_contract_issues(loaded.frame, density_role_columns)
+            )
+
+        density_strict = not density_issues
+        if density_strict:
+            layouts.append("density_ridgeline3d_mixed_wide")
+    trajectory_x = [
+        profile
+        for profile in profiles
+        if profile["kind"] == "numeric" and "z_real" in profile["semantic_tags"]
+    ]
+    trajectory_z = [
+        profile
+        for profile in profiles
+        if profile["kind"] == "numeric" and _explicit_negative_zimag_header(str(profile["name"]))
+    ]
+    trajectory_y = [
+        profile
+        for profile in profiles
+        if profile["kind"] == "numeric"
+        and "z_real" not in profile["semantic_tags"]
+        and "z_imag" not in profile["semantic_tags"]
+        and _trajectory3d_semantic_axis_header(str(profile["name"]))
+    ]
+    trajectory_series = [
+        profile
+        for profile in profiles
+        if "series_id" in profile["semantic_tags"] and 1 <= int(profile["unique_count"]) <= 6
+    ]
+    if (
+        len(trajectory_x) == 1
+        and len(trajectory_y) == 1
+        and len(trajectory_z) == 1
+        and len(trajectory_series) == 1
+    ):
+        layouts.append("trajectory3d_long")
+    if not layouts:
+        layouts.append("unclassified_rectangular")
+
+    domain_signals = {
+        "xps": sum(tag in tags for tag in ("xps_energy", "background", "envelope", "residual")),
+        "xrd": int("xrd_angle" in tags),
+        "xas": int("absorption" in tags),
+        "eis": sum(tag in tags for tag in ("z_real", "z_imag", "frequency", "phase")),
+        "electrochem": sum(tag in tags for tag in ("potential", "current")),
+        "sankey": sum(tag in tags for tag in ("source", "target", "value")),
+        "circular_network": sum(
+            tag in tags for tag in ("panel", "source", "target", "value")
+        ),
+        "error": int("error" in tags),
+        "distribution": int("numeric_wide" in layouts),
+        "forest": sum(tag in tags for tag in ("estimate", "lower", "upper", "reference")),
+        "bubble": int("size" in tags),
+        "diagnostic": int("diagnostic_coordinates" in layouts),
+        "calibration": int("calibration_bins" in layouts),
+        "decision": int("decision_net_benefit" in layouts),
+        "confusion": int("confusion_matrix" in layouts),
+        "agreement": int("bland_altman_limits" in layouts),
+        "paired": int("paired_wide" in layouts),
+        "shap": int("shap_long" in layouts),
+        "grouped_box": int("grouped_box_wide" in layouts),
+        "pl": sum(tag in tags for tag in ("pl_signal", "time", "fit")),
+        "dsc": sum(tag in tags for tag in ("temperature", "heat_flow")),
+        "nmr": sum(tag in tags for tag in ("chemical_shift", "nmr_signal")),
+        "ftir": sum(tag in tags for tag in ("wavenumber", "ir_signal")),
+        "uv_vis": sum(tag in tags for tag in ("wavelength", "uv_signal", "tauc", "bandgap")),
+        "trajectory3d": int("trajectory3d_long" in layouts),
+        "density_ridgeline3d": len(density_required_roles) if density_strict else 0,
+    }
+
+    return {
+        "schema_version": "1.0",
+        "ok": True,
+        "engine_home": str(root),
+        "source": {
+            "path": loaded.source_path,
+            "sha256": loaded.source_sha256,
+            "size_bytes": loaded.source_size_bytes,
+            "format": loaded.source_format,
+            "delimiter": loaded.delimiter,
+            "sheet": loaded.sheet_name,
+            "profile": loaded.source_profile,
+            "header_row_number": loaded.header_row_number,
+            "metadata_record_count": len(loaded.metadata),
+            "metadata": [{"key": key, "value": value} for key, value in loaded.metadata],
+        },
+        "table": {
+            "row_count": len(loaded.frame),
+            "column_count": len(loaded.columns),
+            "ignored_empty_rows": loaded.ignored_empty_rows,
+            "numeric_column_count": len(numeric_columns),
+            "categorical_column_count": len(categorical_columns),
+            "numeric_columns": numeric_columns,
+            "categorical_columns": categorical_columns,
+            "layouts": layouts,
+            "all_numeric_values_nonnegative": all_nonnegative,
+            "first_category_unique_count": first_category_unique,
+            "maximum_category_label_length": max_label_length,
+            "density_ridgeline3d_detection": {
+                "detected_role_count": density_roles_detected,
+                "required_role_count": len(density_required_roles),
+                "candidate": density_candidate,
+                "strict": density_strict,
+                "requires_confirmation": bool(density_candidate and not density_strict),
+                "role_columns": density_role_columns,
+                "issues": density_issues,
+            },
+        },
+        "domain_signals": domain_signals,
+        "columns": profiles,
+    }
+
+
+_INTENT_KEYWORDS: dict[str, tuple[str, ...]] = {
+    "xps": ("xps", "photoelectron", "光电子", "结合能", "分峰"),
+    "xps_compare": (
+        "xpscomparison",
+        "xpscompare",
+        "xpsmulti",
+        "multispectrumxps",
+        "xps对比",
+        "xps多谱线",
+        "多样品xps",
+        "结合能对比",
+    ),
+    "xrd": ("xrd", "diffraction", "衍射", "物相"),
+    "xas": ("xas", "xanes", "exafs", "absorption", "吸收谱"),
+    "eis": ("eis", "impedance", "nyquist", "bode", "阻抗"),
+    "cv": ("cv", "cyclicvoltammetry", "循环伏安"),
+    "lsv": ("lsv", "linearsweep", "线性扫描"),
+    "bar": ("bar", "column", "柱状", "组间比较"),
+    "horizontal_bar": ("horizontalbar", "ranking", "横向条形", "排名", "长标签"),
+    "stacked_bar": ("stacked", "composition", "堆叠", "构成"),
+    "percent_stacked_bar": ("percentstacked", "percentagecomposition", "百分比堆叠", "占比"),
+    "pie": ("pie", "parttowhole", "饼图", "份额"),
+    "sankey": ("sankey", "flow", "桑基", "流向"),
+    "circular_network": (
+        "circularnetwork",
+        "directednetwork",
+        "weightednetwork",
+        "temporalnetwork",
+        "multipanelnetwork",
+        "环形网络",
+        "有向网络",
+        "加权网络",
+        "时段网络",
+        "多面板网络",
+    ),
+    "scatter": ("scatter", "correlation", "relationship", "散点", "相关", "关系"),
+    "line_error": ("errorbar", "uncertainty", "trend", "误差", "不确定性", "趋势"),
+    "trend": ("trendline", "timeseries", "progression", "折线趋势", "时间趋势", "阶段变化"),
+    "radar": ("radar", "spider", "multimetric", "雷达", "蛛网", "多指标"),
+    "heatmap": ("heatmap", "matrix", "colormap", "热力图", "矩阵", "色块图"),
+    "raw_summary": ("rawsummary", "stripplot", "dotplot", "observations", "原始点", "原始观测", "点汇总"),
+    "violin": ("violin", "violinplot", "小提琴", "小提琴图"),
+    "histogram": ("histogram", "frequencydistribution", "直方图", "频数分布"),
+    "forest": ("forestplot", "effectestimate", "confidenceinterval", "森林图", "效应量", "置信区间"),
+    "bubble": ("bubbleplot", "indexedsize", "气泡图", "气泡", "大小映射"),
+    "diagnostic_curve": ("roc", "precisionrecall", "prcurve", "诊断曲线", "受试者工作特征", "精确率召回率"),
+    "confusion_matrix": ("confusionmatrix", "classificationmatrix", "混淆矩阵", "分类矩阵"),
+    "bland_altman": ("blandaltman", "agreement", "methodcomparison", "一致性", "方法比较"),
+    "paired_trajectory": ("paired", "longitudinal", "trajectory", "配对", "纵向", "轨迹"),
+    "calibration_curve": ("calibrationcurve", "reliability", "校准曲线", "可靠性"),
+    "decision_curve": ("decisioncurve", "netbenefit", "dca", "决策曲线", "净获益"),
+    "raincloud": ("raincloud", "raincloudplot", "halfviolin", "雨云图", "半小提琴"),
+    "shap_dashboard": ("shap dashboard", "nested donut", "双层环图", "分栏 SHAP", "shap 分栏"),
+    "shap_summary": (
+        "shapsummary",
+        "shapbeeswarm",
+        "shapcomposite",
+        "meanabsoluteshap",
+        "featurecontribution",
+        "shap汇总",
+        "shap蜂群",
+        "shap复合图",
+        "平均绝对shap",
+        "特征贡献",
+    ),
+    "grouped_box": ("groupedbox", "boxplot", "boxanddots", "分组箱线", "箱线图", "箱体图"),
+    "pl": ("pl", "trpl", "photoluminescence", "luminescence", "光致发光", "荧光寿命", "时间分辨荧光"),
+    "dsc": (
+        "dsc",
+        "differentialscanningcalorimetry",
+        "heatflow",
+        "差示扫描量热",
+        "热流",
+    ),
+    "nmr": (
+        "nmr",
+        "nuclearmagneticresonance",
+        "chemicalshift",
+        "核磁",
+        "核磁共振",
+        "化学位移",
+    ),
+    "ftir": (
+        "ftir",
+        "infrared",
+        "irspectrum",
+        "wavenumber",
+        "红外",
+        "傅里叶红外",
+        "波数",
+    ),
+    "uv_vis": (
+        "uvvis",
+        "uv-vis",
+        "absorbance",
+        "transmittance",
+        "tauc",
+        "紫外可见",
+        "吸光度",
+        "透过率",
+        "带隙",
+    ),
+    "trajectory3d": ("trajectory3d", "3dnyquist", "3dtrajectory", "三维nyquist", "三维阻抗", "三维轨迹"),
+    "density_ridgeline3d": (
+        "densityridgeline3d",
+        "3ddensityprofile",
+        "3ddensitycurve",
+        "baselinefocus",
+        "三维密度曲线",
+        "三维密度轮廓",
+        "基线焦点",
+        "焦点定位",
+    ),
+}
+
+
+def _intent_match(template_id: str, intent: str) -> bool:
+    canonical = _canonical(intent)
+    if (
+        template_id == "xps"
+        and canonical
+        and any(_canonical(item) in canonical for item in _INTENT_KEYWORDS["xps_compare"])
+    ):
+        return False
+    return bool(canonical) and any(_canonical(item) in canonical for item in _INTENT_KEYWORDS[template_id])
+
+
+def _first_numeric_profile(inspection: dict[str, Any]) -> dict[str, Any] | None:
+    return next((item for item in inspection["columns"] if item["kind"] == "numeric"), None)
+
+
+def _score_candidate(
+    template_id: str,
+    preparation: Any,
+    inspection: dict[str, Any],
+    intent: str,
+) -> tuple[float, list[str], list[str]]:
+    table = inspection["table"]
+    layouts = set(table["layouts"])
+    signals = inspection["domain_signals"]
+    score = 0.22 + 0.36 * float(preparation.confidence)
+    reason_codes = ["template_preparation_succeeded"]
+    reasons = [f"模板内部数据校验通过，列识别置信度 {preparation.confidence:.2f}。"]
+
+    if _intent_match(template_id, intent):
+        score += 0.28
+        reason_codes.append("intent_match")
+        reasons.append("与用户描述的绘图意图直接匹配。")
+
+    domain_map = {
+        "xps": "xps",
+        "xps_compare": "xps",
+        "xrd": "xrd",
+        "xas": "xas",
+        "eis": "eis",
+        "pl": "pl",
+        "dsc": "dsc",
+        "nmr": "nmr",
+        "ftir": "ftir",
+        "uv_vis": "uv_vis",
+    }
+    if template_id in domain_map:
+        signal = int(signals[domain_map[template_id]])
+        if signal:
+            score += min(0.36, 0.15 + 0.09 * signal)
+            reason_codes.append("domain_header_match")
+            reasons.append("表头包含该领域的明确列语义。")
+        elif not _intent_match(template_id, intent):
+            score -= 0.34
+            reason_codes.append("domain_signal_missing")
+
+    if template_id in {"cv", "lsv"}:
+        signal = int(signals["electrochem"])
+        if signal >= 2:
+            score += 0.22
+            reason_codes.append("electrochem_header_match")
+            reasons.append("电位和电流列语义明确。")
+        elif not _intent_match(template_id, intent):
+            score -= 0.30
+        first = _first_numeric_profile(inspection)
+        changes = int(first.get("direction_changes", 0)) if first else 0
+        if template_id == "cv" and changes >= 1:
+            score += 0.10
+            reasons.append("自变量存在扫描方向变化，符合循环扫描特征。")
+        if (
+            template_id == "lsv"
+            and first
+            and (first.get("monotonic_increasing") or first.get("monotonic_decreasing"))
+        ):
+            score += 0.07
+
+    category_templates = {
+        "bar",
+        "horizontal_bar",
+        "stacked_bar",
+        "percent_stacked_bar",
+        "pie",
+        "radar",
+        "heatmap",
+        "confusion_matrix",
+    }
+    if template_id in category_templates:
+        if "category_wide" in layouts:
+            score += 0.16
+            reason_codes.append("category_wide_match")
+            reasons.append("类别列加数值系列的宽表结构适配该图形。")
+        else:
+            score -= 0.30
+        if "interval_table" in layouts:
+            score -= 0.18
+            reason_codes.append("explicit_interval_route_preferred")
+
+    numeric_count = int(table["numeric_column_count"])
+    category_count = int(table["first_category_unique_count"])
+    long_label = int(table["maximum_category_label_length"])
+    all_nonnegative = bool(table["all_numeric_values_nonnegative"])
+    dense_matrix_without_explicit_intent = (
+        "matrix_candidate" in layouts
+        and category_count >= 12
+        and numeric_count >= 12
+        and not any(_intent_match(item, intent) for item in category_templates)
+    )
+
+    if (
+        dense_matrix_without_explicit_intent
+        and template_id
+        in {
+            "bar",
+            "horizontal_bar",
+            "stacked_bar",
+            "percent_stacked_bar",
+            "pie",
+            "radar",
+        }
+    ):
+        score -= 0.18
+        reason_codes.append("dense_matrix_heatmap_route_preferred")
+        reasons.append("检测到高维类别矩阵；默认采用热力图，避免生成不可读的超密集柱形或雷达图。")
+
+    if template_id == "bar" and "category_wide" in layouts:
+        score += 0.05
+    elif template_id == "horizontal_bar":
+        if long_label >= 12 or category_count > 8:
+            score += 0.15
+            reasons.append("类别较多或标签较长，横向条形更易阅读。")
+        else:
+            score -= 0.03
+    elif template_id == "stacked_bar":
+        score += 0.12 if numeric_count >= 2 and all_nonnegative else -0.22
+    elif template_id == "percent_stacked_bar":
+        score += 0.10 if numeric_count >= 2 and all_nonnegative else -0.28
+        if not _intent_match(template_id, intent):
+            score -= 0.07
+            reason_codes.append("percent_transform_needs_intent")
+    elif template_id == "pie":
+        score += 0.15 if numeric_count == 1 and 1 < category_count <= 8 and all_nonnegative else -0.28
+        if category_count > 8:
+            reason_codes.append("too_many_pie_categories")
+    elif template_id == "radar":
+        if 3 <= category_count <= 12 and numeric_count >= 2 and all_nonnegative:
+            score += 0.12
+            reason_codes.append("multimetric_profile_match")
+            reasons.append("检测到至少三个指标和多个非负对象系列。")
+        else:
+            score -= 0.30
+        if not _intent_match(template_id, intent):
+            score -= 0.03
+            reason_codes.append("radar_scale_confirmation_preferred")
+    elif template_id == "heatmap":
+        if "matrix_candidate" in layouts and category_count >= 2 and numeric_count >= 2:
+            score += 0.12
+            reason_codes.append("matrix_candidate_match")
+            reasons.append("类别 × 数值系列的矩形结构适合颜色矩阵。")
+            if dense_matrix_without_explicit_intent:
+                score += 0.16
+                reason_codes.append("dense_matrix_match")
+                reasons.append("行列均达到 12 个以上，颜色矩阵比逐系列图形更清晰。")
+        else:
+            score -= 0.30
+        if "confusion_matrix" in layouts and _intent_match("confusion_matrix", intent):
+            score -= 0.24
+            reason_codes.append("confusion_matrix_route_preferred")
+    elif template_id == "confusion_matrix":
+        if "confusion_matrix" in layouts:
+            score += 0.34
+            reason_codes.append("actual_predicted_matrix_match")
+            reasons.append("检测到实际类别行与预测类别数值矩阵。")
+        else:
+            score -= 0.42
+
+    if (
+        "confusion_matrix" in layouts
+        and _intent_match("confusion_matrix", intent)
+        and template_id in category_templates
+        and template_id != "confusion_matrix"
+    ):
+        score -= 0.20
+        reason_codes.append("explicit_confusion_intent_prefers_matrix_route")
+
+    if template_id == "sankey":
+        if "edge_list" in layouts:
+            score += 0.42
+            reason_codes.append("edge_list_match")
+            reasons.append("检测到 source、target、value 边列表。")
+        else:
+            score -= 0.45
+        if "temporal_edge_list" in layouts:
+            score -= 0.48
+            reason_codes.append("temporal_network_route_preferred")
+            reasons.append("检测到显式 Panel/时期列；应保留面板语义，而不是合并成单个桑基图。")
+    elif template_id == "circular_network":
+        if "temporal_edge_list" in layouts and int(signals["circular_network"]) >= 4:
+            score += 0.48
+            reason_codes.append("temporal_directed_edge_list_match")
+            reasons.append(
+                "检测到 Panel、Source、Target、Weight 有向边长表，可保留时段分面、方向和全局权重尺度。"
+            )
+        else:
+            score -= 0.60
+            reason_codes.append("temporal_directed_edge_list_missing")
+    elif template_id in {"scatter", "trend"}:
+        if "numeric_xy" in layouts:
+            score += 0.15
+            reason_codes.append("numeric_xy_match")
+            reasons.append("包含连续数值 X 与一个或多个数值观测系列。")
+            if template_id == "scatter" and int(table["row_count"]) > 100:
+                score += 0.04
+            if template_id == "trend" and _intent_match(template_id, intent):
+                first = _first_numeric_profile(inspection)
+                if first and (first.get("monotonic_increasing") or first.get("monotonic_decreasing")):
+                    score += 0.04
+                    reason_codes.append("ordered_x_match")
+                    reasons.append("第一数值列单调有序，适合连续过程趋势。")
+        else:
+            score -= 0.25
+        if template_id == "scatter" and "indexed_size" in layouts:
+            score -= 0.25
+            reason_codes.append("indexed_size_route_preferred")
+    elif template_id == "line_error":
+        if "error_wide" in layouts:
+            score += 0.37
+            reason_codes.append("error_column_match")
+            reasons.append("检测到明确的误差列后缀或中文误差语义。")
+        elif _intent_match(template_id, intent):
+            score -= 0.05
+        else:
+            score -= 0.30
+
+    if template_id == "grouped_box":
+        if "grouped_box_wide" in layouts:
+            score += 0.40
+            reason_codes.append("grouped_box_header_match")
+            reasons.append("检测到 Category | Group 原始观测宽表，可保留分组箱体、原始点和样本量。")
+        else:
+            score -= 0.45
+
+    if template_id in {"raw_summary", "violin", "raincloud", "histogram"}:
+        if "numeric_wide" not in layouts:
+            score -= 0.40
+        elif template_id == "histogram":
+            if "numeric_univariate" in layouts:
+                score += 0.27
+                reason_codes.append("univariate_distribution_match")
+                reasons.append("检测到单列原始连续观测，适合冻结分箱规则的直方图。")
+            else:
+                score += 0.08
+                reason_codes.append("multiple_distribution_series")
+        elif template_id == "raw_summary":
+            score += 0.22 if int(table["row_count"]) <= 80 else 0.12
+            reason_codes.append("raw_observation_table_match")
+            reasons.append("纯数值宽表可保留每个原始观测和组中位数。")
+        elif template_id == "raincloud":
+            score += 0.24 if int(table["row_count"]) >= 12 else 0.11
+            reason_codes.append("raincloud_distribution_match")
+            reasons.append("纯数值宽表可用半小提琴、全部原始点与均值 ± 1 SD 展示分布。")
+            if not _intent_match(template_id, intent):
+                score -= 0.08
+                reason_codes.append("raincloud_intent_preferred")
+        else:
+            score += 0.22 if int(table["row_count"]) >= 20 else 0.12
+            reason_codes.append("distribution_density_match")
+            reasons.append("每组观测数量足以展示分布形状与箱线摘要。")
+        first_profile = _first_numeric_profile(inspection)
+        first_name = _canonical(first_profile["name"]) if first_profile else ""
+        if template_id in {"raw_summary", "violin", "raincloud"} and first_name in {
+            "x",
+            "xvalue",
+            "time",
+            "step",
+            "epoch",
+            "dose",
+            "自变量",
+            "时间",
+            "步数",
+            "剂量",
+        }:
+            score -= 0.28
+            reason_codes.append("leading_x_column_penalty")
+        if "grouped_box_wide" in layouts:
+            score -= 0.30
+            reason_codes.append("grouped_box_route_preferred")
+
+    if template_id == "forest":
+        if "interval_table" in layouts:
+            score += 0.42
+            reason_codes.append("explicit_interval_table_match")
+            reasons.append("检测到标签、估计值和显式置信区间上下限。")
+        else:
+            score -= 0.45
+
+    if template_id == "bubble":
+        if "indexed_size" in layouts:
+            score += 0.38
+            reason_codes.append("indexed_size_match")
+            reasons.append("检测到 X、Y 和正值 Size 列，可使用面积编码第三变量。")
+        else:
+            score -= 0.42
+
+    if template_id == "trajectory3d":
+        if "trajectory3d_long" in layouts:
+            score += 0.46
+            reason_codes.append("explicit_xyz_series_long_match")
+            reasons.append("检测到明确的 Zreal、带科学含义和单位的真实第三轴、-Zimag 与 Series 长表。")
+        else:
+            score -= 0.60
+            reason_codes.append("explicit_xyz_series_evidence_missing")
+    elif template_id == "density_ridgeline3d":
+        if "density_ridgeline3d_mixed_wide" in layouts:
+            score += 0.46
+            reason_codes.append("explicit_precomputed_dual_density_3d_match")
+            reasons.append(
+                "检测到六个唯一 mixed-wide 角色、同行的实线/虚线预计算密度、"
+                "带单位的横轴与真实条件轴，以及每组一个用户提供的基线焦点。"
+            )
+        elif "density_ridgeline3d_candidate" in layouts:
+            score -= 0.34
+            reason_codes.append("density_ridgeline3d_role_conflict_requires_confirmation")
+            reasons.append("六类表头语义已出现，但单位、角色唯一性、条件映射、密度完整性或每组焦点数目存在冲突，必须人工确认。")
+        else:
+            score -= 0.62
+            reason_codes.append("explicit_precomputed_dual_density_3d_evidence_missing")
+    elif template_id == "eis" and "trajectory3d_long" in layouts:
+        score -= 0.38
+        reason_codes.append("trajectory3d_route_preferred")
+        reasons.append("数据包含真实第三轴和 Series 长表，应保留三维条件语义而不是忽略附加列。")
+
+    medical_layouts = {
+        "diagnostic_curve": ("diagnostic_coordinates", "diagnostic_coordinate_match"),
+        "calibration_curve": ("calibration_bins", "calibration_bin_match"),
+        "decision_curve": ("decision_net_benefit", "decision_curve_match"),
+        "bland_altman": ("bland_altman_limits", "agreement_limit_match"),
+        "paired_trajectory": ("paired_wide", "paired_identity_match"),
+        "shap_summary": ("shap_long", "precomputed_shap_long_match"),
+        "shap_dashboard": ("shap_long", "precomputed_shap_dashboard_match"),
+    }
+    if template_id in medical_layouts:
+        layout, code = medical_layouts[template_id]
+        if layout in layouts:
+            score += 0.34
+            reason_codes.append(code)
+            reasons.append("检测到该医学证据图所需的显式列语义和数据布局。")
+        else:
+            score -= 0.42
+
+    if preparation.requires_confirmation:
+        score -= 0.08
+        reason_codes.append("column_confirmation_required")
+        reasons.append("模板内部仍要求确认列角色。")
+
+    return max(0.01, min(0.99, score)), reason_codes, reasons
+
+
+def recommend_charts(
+    path: str | Path,
+    *,
+    intent: str = "",
+    engine_home: str | Path | None = None,
+    limit: int = 3,
+) -> dict[str, Any]:
+    """Rank verified public Origin routes using data semantics, shape, intent, and service validation."""
+    inspection = inspect_data(path, engine_home=engine_home)
+    root = bootstrap_engine(engine_home)
+    try:
+        from origin_sciplot.template_service import TemplateServiceError, TemplateServiceRegistry
+    except Exception as exc:  # noqa: BLE001
+        raise EditaPlotError("engine_import_failed", f"Could not import template services: {exc}") from exc
+
+    services = TemplateServiceRegistry()
+    candidates: list[dict[str, Any]] = []
+    rejected: list[dict[str, str]] = []
+    for service in services.implemented():
+        template_id = str(service.manifest.id)
+        if template_id not in VERIFIED_TEMPLATE_IDS:
+            continue
+        try:
+            prepared = service.prepare(path)
+        except TemplateServiceError as exc:
+            rejected.append({"template_id": template_id, "code": exc.code})
+            continue
+        score, reason_codes, reasons = _score_candidate(template_id, prepared, inspection, intent)
+        candidates.append(
+            {
+                "template_id": template_id,
+                "template_name": service.manifest.name,
+                "support_level": "verified",
+                "score": round(score, 4),
+                "internal_confidence": round(float(prepared.confidence), 4),
+                "requires_column_confirmation": bool(prepared.requires_confirmation),
+                "renderer_template_id": prepared.renderer_template_id,
+                "summary": prepared.summary.heading,
+                "reason_codes": reason_codes,
+                "reasons": reasons,
+                "warnings": list(prepared.summary.warnings),
+            }
+        )
+
+    candidates.sort(key=lambda item: (-item["score"], item["template_id"]))
+    top = candidates[0] if candidates else None
+    second_score = candidates[1]["score"] if len(candidates) > 1 else 0.0
+    margin = (top["score"] - second_score) if top else 0.0
+    selected = candidates[: max(1, limit)]
+    density_detection = inspection["table"].get("density_ridgeline3d_detection", {})
+    density_contract_conflict = bool(density_detection.get("requires_confirmation"))
+    density_mapping_requires_confirmation = any(
+        candidate["template_id"] == "density_ridgeline3d"
+        and candidate["requires_column_confirmation"]
+        for candidate in candidates
+    )
+    auto_allowed = bool(
+        top
+        and top["score"] >= AUTO_SCORE_THRESHOLD
+        and margin >= AUTO_MARGIN_THRESHOLD
+        and not top["requires_column_confirmation"]
+        and not density_contract_conflict
+        and not density_mapping_requires_confirmation
+    )
+    gate_reasons: list[str] = []
+    if top is None:
+        gate_reasons.append("no_verified_template_accepts_data")
+    else:
+        if top["score"] < AUTO_SCORE_THRESHOLD:
+            gate_reasons.append("top_score_below_threshold")
+        if margin < AUTO_MARGIN_THRESHOLD:
+            gate_reasons.append("candidate_margin_too_small")
+        if top["requires_column_confirmation"]:
+            gate_reasons.append("column_confirmation_required")
+    if density_contract_conflict:
+        gate_reasons.append("density_ridgeline3d_contract_requires_confirmation")
+    if density_mapping_requires_confirmation:
+        gate_reasons.append("density_ridgeline3d_mapping_requires_confirmation")
+
+    return {
+        "schema_version": "1.0",
+        "ok": True,
+        "source": inspection["source"],
+        "intent": intent,
+        "inspection_summary": {
+            "layouts": inspection["table"]["layouts"],
+            "row_count": inspection["table"]["row_count"],
+            "column_count": inspection["table"]["column_count"],
+            "domain_signals": inspection["domain_signals"],
+        },
+        "candidates": selected,
+        "auto_selection": {
+            "allowed": auto_allowed,
+            "selected_template_id": top["template_id"] if auto_allowed and top else None,
+            "top_score": top["score"] if top else None,
+            "margin": round(margin, 4),
+            "required_score": AUTO_SCORE_THRESHOLD,
+            "required_margin": AUTO_MARGIN_THRESHOLD,
+            "gate_reasons": gate_reasons,
+        },
+        "rejected_template_count": len(rejected),
+        "engine_home": str(root),
+    }
+
+
+_PRECOMPUTED_EVIDENCE: dict[str, str] = {
+    "forest": "效应值与置信区间上下限",
+    "diagnostic_curve": "ROC/PR 曲线坐标，以及需要展示的 AUC 等指标",
+    "confusion_matrix": "混淆矩阵的计数或比例",
+    "bland_altman": "配对均值、差值、偏倚和一致性界限",
+    "calibration_curve": "分箱后的预测概率、观察比例和分箱样本数",
+    "decision_curve": "各阈值下的模型、全部干预和不干预净获益",
+    "shap_summary": "已经由模型计算好的 SHAP 值",
+    "shap_dashboard": "预计算 SHAP 与明确特征组，用分栏和双环展示",
+}
+
+
+def _beginner_candidate(candidate: dict[str, Any]) -> dict[str, Any]:
+    """Keep only recommendation facts useful to a conversational Skill."""
+    return {
+        "template_id": candidate["template_id"],
+        "template_name": candidate["template_name"],
+        "score": candidate["score"],
+        "requires_column_confirmation": candidate["requires_column_confirmation"],
+        "reasons": candidate["reasons"],
+        "warnings": candidate["warnings"],
+    }
+
+
+def _prepare_template_for_understanding(
+    path: str | Path,
+    *,
+    template_id: str,
+    mapping: dict[str, Any] | None,
+    engine_home: str | Path | None,
+) -> tuple[Any, Any, Path]:
+    """Prepare one route without previewing, rendering, or calling Origin."""
+
+    root = bootstrap_engine(engine_home)
+    try:
+        from origin_sciplot.template_service import TemplateServiceError, TemplateServiceRegistry
+    except Exception as exc:  # noqa: BLE001
+        raise EditaPlotError("engine_import_failed", f"Could not import template services: {exc}") from exc
+
+    registry = TemplateServiceRegistry()
+    try:
+        service = registry.get(template_id)
+        prepared = service.prepare(path)
+        if mapping is not None:
+            assignments = mapping.get("assignments")
+            if not isinstance(assignments, dict):
+                raise EditaPlotError("mapping_invalid", "Mapping JSON needs an assignments object.")
+            context = str(mapping.get("energy_kind") or mapping.get("plot_mode") or "")
+            prepared = service.confirm_mapping(
+                prepared,
+                assignments={str(key): str(value) for key, value in assignments.items()},
+                energy_kind=context,
+            )
+    except TemplateServiceError as exc:
+        raise EditaPlotError(exc.code, str(exc)) from exc
+    return service, prepared, root
+
+
+def _proposal_for_prepared(
+    prepared: Any,
+    *,
+    template_id: str,
+    source_path: str | Path,
+) -> Any:
+    """Select a domain adapter, falling back to the generic prepared-route bridge."""
+
+    try:
+        if template_id == "xrd":
+            payload = getattr(prepared, "payload", None)
+            if bool(getattr(payload, "mapping_confirmed", False)):
+                # A corrected XRD mapping is the user's scientific decision.
+                # Project that frozen preparation instead of re-running the
+                # raw header detector and reintroducing the ambiguity that the
+                # user has just resolved.
+                from origin_sciplot.semantic_analysis import propose_prepared_semantics
+
+                return propose_prepared_semantics(prepared)
+            from origin_sciplot.data_loader import load_table
+            from origin_sciplot.xrd_semantics import propose_xrd_semantics
+
+            return propose_xrd_semantics(load_table(source_path))
+        from origin_sciplot.semantic_analysis import propose_prepared_semantics
+
+        return propose_prepared_semantics(prepared)
+    except Exception as exc:  # noqa: BLE001 - normalized to the public Skill error envelope
+        code = getattr(exc, "code", "semantic_understanding_failed")
+        raise EditaPlotError(code, str(exc)) from exc
+
+
+def _semantic_confirmation_template(proposal: Any) -> dict[str, Any]:
+    proposal_payload = proposal.to_dict()
+    return {
+        "proposal_hash": proposal.proposal_hash,
+        "confirmed": True,
+        "approved_derived_item_ids": [item["item_id"] for item in proposal_payload["derived_items"]],
+        "resolved_ambiguities": {
+            item["ambiguity_id"]: (item["options"][0] if item["options"] else "<请填写确认结论>")
+            for item in proposal_payload["ambiguities"]
+            if item["blocking"]
+        },
+    }
+
+
+def _semantic_decision_zh(disposition: str) -> str:
+    return {
+        "render_primary": "主要图形元素：默认绘制",
+        "render_secondary": "辅助图形元素：按合同绘制",
+        "support_only": "仅用于计算、筛选或验证：不画成曲线",
+        "retain_not_render": "保留在数据/工作簿中：不在图上呈现",
+        "uncertain": "含义不确定：必须先确认或修正映射",
+    }.get(disposition, "需要确认")
+
+
+def understand_data(
+    path: str | Path,
+    *,
+    template_id: str,
+    mapping: dict[str, Any] | None = None,
+    engine_home: str | Path | None = None,
+) -> dict[str, Any]:
+    """Explain every source column and intended figure element before planning.
+
+    The result is a read-only proposal.  It is deliberately not executable
+    until the caller sends the exact proposal hash and explicit confirmation
+    back to :func:`build_plan`.
+    """
+
+    source_path = Path(path).expanduser()
+    before_sha256 = _sha256(source_path)
+    service, prepared, _root = _prepare_template_for_understanding(
+        source_path,
+        template_id=template_id,
+        mapping=mapping,
+        engine_home=engine_home,
+    )
+    proposal = _proposal_for_prepared(
+        prepared,
+        template_id=template_id,
+        source_path=source_path,
+    )
+    proposal_payload = proposal.to_dict()
+    after_sha256 = _sha256(source_path)
+    if len({before_sha256, after_sha256, proposal.source_sha256}) != 1:
+        raise EditaPlotError(
+            "source_changed_during_understanding",
+            "The source file changed while EditaPlot was interpreting it.",
+        )
+
+    uncertain_items = [
+        item["item_id"] for item in proposal_payload["data_items"] if item["disposition"] == "uncertain"
+    ]
+    blocking_ambiguities = [
+        item["ambiguity_id"] for item in proposal_payload["ambiguities"] if item["blocking"]
+    ]
+    can_confirm = not uncertain_items
+    return {
+        "schema_version": "1.0",
+        "ok": True,
+        "state": ("awaiting_semantic_confirmation" if can_confirm else "awaiting_column_meaning_correction"),
+        "source": {
+            "file_name": source_path.name,
+            "sha256": proposal.source_sha256,
+            "columns": list(proposal.source_columns),
+            "bytes_unchanged": True,
+        },
+        "template": {
+            "id": template_id,
+            "name": service.manifest.name,
+        },
+        "understanding": {
+            "domain": proposal_payload["domain"],
+            "proposal_hash": proposal.proposal_hash,
+            "column_decisions": [
+                {
+                    **item,
+                    "decision_zh": _semantic_decision_zh(str(item["disposition"])),
+                }
+                for item in proposal_payload["data_items"]
+            ],
+            "derived_items": proposal_payload["derived_items"],
+            "figure_elements": proposal_payload["figure_elements"],
+            "ambiguities": proposal_payload["ambiguities"],
+        },
+        "confirmation_gate": {
+            "required": True,
+            "can_confirm_now": can_confirm,
+            "uncertain_item_ids": uncertain_items,
+            "blocking_ambiguity_ids": blocking_ambiguities,
+            "message_zh": (
+                "请核对：数据类型、每列用途、需要画出的元素、只用于计算/验证的列，以及明确不画的列。"
+                "确认无误后，再把下面的确认对象交给 plan。"
+                if can_confirm
+                else "当前仍有不确定列；请先说明列含义或提供修正后的列映射，再重新生成元素清单。"
+            ),
+            "confirmation_payload_template": _semantic_confirmation_template(proposal),
+        },
+        "execution": {
+            "plan_created": False,
+            "render_started": False,
+            "origin_called": False,
+        },
+    }
+
+
+def inspect_reference(
+    path: str | Path,
+    *,
+    engine_home: str | Path | None = None,
+) -> dict[str, Any]:
+    """Validate one local reference image without OCR or model inference."""
+
+    bootstrap_engine(engine_home)
+    try:
+        from origin_sciplot.reference_figure import inspect_reference_image
+
+        metadata = inspect_reference_image(path)
+    except Exception as exc:  # noqa: BLE001 - normalized public error envelope
+        code = getattr(exc, "code", "reference_image_invalid")
+        raise EditaPlotError(code, str(exc)) from exc
+    return {
+        "schema_version": "1.0",
+        "ok": True,
+        "reference": metadata.to_dict(),
+        "next_step": {
+            "action": "describe_reference_grammar",
+            "message_zh": (
+                "请让 Codex 只提取参考图的面板、图形标记、编码关系、布局和视觉层级；"
+                "不要复制原图数值、统计结果、作者文字、Logo 或水印。"
+            ),
+        },
+    }
+
+
+def review_reference_figure(
+    image_path: str | Path,
+    spec_payload: dict[str, Any],
+    *,
+    engine_home: str | Path | None = None,
+) -> dict[str, Any]:
+    """Validate a model-described reference grammar and ask for user approval."""
+
+    bootstrap_engine(engine_home)
+    try:
+        from origin_sciplot.reference_figure import (
+            ReferenceFigureSpec,
+            inspect_reference_image,
+        )
+
+        metadata = inspect_reference_image(image_path)
+        spec = ReferenceFigureSpec.from_dict(spec_payload, image_metadata=metadata)
+    except Exception as exc:  # noqa: BLE001 - normalized public error envelope
+        code = getattr(exc, "code", "reference_spec_invalid")
+        raise EditaPlotError(code, str(exc)) from exc
+    if spec.confirmed:
+        raise EditaPlotError(
+            "reference_review_requires_draft",
+            "Reference review requires an unconfirmed draft; confirmation is a separate user action.",
+        )
+    payload = spec.to_dict()
+    return {
+        "schema_version": "1.0",
+        "ok": True,
+        "state": "awaiting_reference_confirmation",
+        "reference": metadata.to_dict(),
+        "reference_understanding": {
+            "contract_sha256": spec.contract_sha256,
+            "layout": payload["layout"],
+            "marks": payload["marks"],
+            "encodings": payload["encodings"],
+            "style": payload["style"],
+            "text_roles": payload["text_roles"],
+            "essential_features": payload["essential_features"],
+        },
+        "confirmation_gate": {
+            "required": True,
+            "message_zh": ("请确认这份理解只保留了图形语法和视觉风格，而且所有必要元素都已绑定到你的数据。"),
+            "confirmation_payload_template": {
+                "reference_contract_hash": spec.contract_sha256,
+                "confirmed": True,
+            },
+        },
+        "safety_boundary": {
+            "copy_reference_values": False,
+            "copy_reference_text": False,
+            "copy_logo_or_watermark": False,
+            "execute_generated_code": False,
+            "origin_called": False,
+        },
+    }
+
+
+def _confirm_reference_spec(
+    image_path: str | Path,
+    spec_payload: dict[str, Any],
+    confirmation: dict[str, Any] | None,
+) -> Any:
+    if not isinstance(confirmation, dict) or confirmation.get("confirmed") is not True:
+        raise EditaPlotError(
+            "reference_confirmation_required",
+            "Review and explicitly confirm the reference-figure understanding before planning.",
+        )
+    try:
+        from origin_sciplot.reference_figure import (
+            ReferenceFigureSpec,
+            inspect_reference_image,
+        )
+
+        metadata = inspect_reference_image(image_path)
+        spec = ReferenceFigureSpec.from_dict(spec_payload, image_metadata=metadata)
+    except Exception as exc:  # noqa: BLE001
+        code = getattr(exc, "code", "reference_spec_invalid")
+        raise EditaPlotError(code, str(exc)) from exc
+    supplied_hash = confirmation.get("reference_contract_hash")
+    if supplied_hash != spec.contract_sha256:
+        raise EditaPlotError(
+            "reference_confirmation_hash_mismatch",
+            "The confirmed reference understanding no longer matches the current image and grammar.",
+            expected_reference_contract_hash=spec.contract_sha256,
+            supplied_reference_contract_hash=supplied_hash,
+        )
+    try:
+        return spec if spec.confirmed else spec.confirm()
+    except Exception as exc:  # noqa: BLE001
+        code = getattr(exc, "code", "reference_confirmation_invalid")
+        raise EditaPlotError(code, str(exc)) from exc
+
+
+def start_session(
+    path: str | Path,
+    *,
+    intent: str = "",
+    engine_home: str | Path | None = None,
+    limit: int = 3,
+) -> dict[str, Any]:
+    """Open a read-only beginner session without planning, fitting, or rendering.
+
+    This envelope is designed for a Skill to translate into a short natural-
+    language conversation.  Even when a verified route clears the automatic
+    recommendation gate, the scientific purpose remains a human confirmation.
+    """
+    source_path = Path(path).expanduser()
+    try:
+        before_sha256 = _sha256(source_path)
+    except FileNotFoundError as exc:
+        raise EditaPlotError("file_not_found", f"Data file does not exist: {source_path}") from exc
+    except IsADirectoryError as exc:
+        raise EditaPlotError("not_a_file", f"Data path is not a file: {source_path}") from exc
+    except OSError as exc:
+        raise EditaPlotError("file_read_error", f"Could not read data file: {source_path}") from exc
+
+    inspection = inspect_data(source_path, engine_home=engine_home)
+    recommendation = recommend_charts(
+        source_path,
+        intent=intent,
+        engine_home=engine_home,
+        limit=limit,
+    )
+    try:
+        after_sha256 = _sha256(source_path)
+    except OSError:
+        after_sha256 = "unavailable_after_inspection"
+    observed_hashes = {
+        "before": before_sha256,
+        "inspection": inspection["source"]["sha256"],
+        "recommendation": recommendation["source"]["sha256"],
+        "after": after_sha256,
+    }
+    if len(set(observed_hashes.values())) != 1:
+        raise EditaPlotError(
+            "source_changed_during_start",
+            "The source file changed while EditaPlot was inspecting it; no session was created.",
+            observed_hashes=observed_hashes,
+        )
+
+    candidates = recommendation["candidates"]
+    top = candidates[0] if candidates else None
+    auto_gate = recommendation["auto_selection"]
+    column_roles = [
+        {
+            "name": profile["name"],
+            "kind": profile["kind"],
+            "semantic_roles": profile["semantic_tags"] or ["未识别，需结合科研语境确认"],
+            "missing_count": profile["missing_count"],
+        }
+        for profile in inspection["columns"]
+    ]
+    unassigned_columns = [
+        profile["name"] for profile in inspection["columns"] if not profile["semantic_tags"]
+    ]
+    error_columns = [
+        profile["name"] for profile in inspection["columns"] if "error" in profile["semantic_tags"]
+    ]
+
+    confirmation_questions: list[dict[str, Any]] = [
+        {
+            "id": "scientific_purpose",
+            "required": True,
+            "question_zh": "请用一句话说明这张图要传达的科学结论、比较目的或读图重点。",
+        }
+    ]
+    if not auto_gate["allowed"]:
+        names = "、".join(
+            f"{candidate['template_name']}（{candidate['template_id']}）" for candidate in candidates
+        )
+        confirmation_questions.append(
+            {
+                "id": "template_choice",
+                "required": True,
+                "question_zh": (
+                    f"当前识别置信度不足，请从候选中确认图表类型：{names}。"
+                    if names
+                    else "当前没有足够证据匹配已验证模板，请说明希望绘制的图表类型。"
+                ),
+            }
+        )
+        if unassigned_columns or (top and top["requires_column_confirmation"]):
+            listed = "、".join(unassigned_columns) if unassigned_columns else "候选模板涉及的列"
+            confirmation_questions.append(
+                {
+                    "id": "column_meanings",
+                    "required": True,
+                    "question_zh": f"请确认这些列在实验中的含义及 X/Y/分组角色：{listed}。",
+                }
+            )
+    if error_columns:
+        confirmation_questions.append(
+            {
+                "id": "error_semantics",
+                "required": True,
+                "question_zh": (
+                    f"请明确误差列 {', '.join(error_columns)} 表示 SD、SE 还是 SEM；"
+                    "EditaPlot 不会根据数值外观猜测误差类型。"
+                ),
+            }
+        )
+
+    selected_template_id = top["template_id"] if top else None
+    all_semantic_tags = {tag for profile in inspection["columns"] for tag in profile["semantic_tags"]}
+    canonical_headers = {_canonical(profile["name"]) for profile in inspection["columns"]}
+    precomputed = _PRECOMPUTED_EVIDENCE.get(selected_template_id or "")
+    if selected_template_id == "xps" and (
+        {"background", "envelope", "residual"} & all_semantic_tags
+        or any(
+            token in header for header in canonical_headers for token in ("component", "peak", "组分", "分峰")
+        )
+    ):
+        precomputed = "文件中实际出现的背景、包络、峰组分或残差等结果"
+    elif selected_template_id == "pl" and (
+        "fit" in all_semantic_tags
+        or any(
+            token in header for header in canonical_headers for token in ("lifetime", "tau", "寿命", "拟合")
+        )
+    ):
+        precomputed = "用户认可的拟合曲线与寿命参数"
+    elif selected_template_id == "uv_vis" and {"tauc", "bandgap"} & all_semantic_tags:
+        precomputed = "Tauc 变换、拟合区间与带隙辅助结果"
+    professional_notice: dict[str, Any] | None = None
+    if precomputed:
+        professional_notice = {
+            "template_id": selected_template_id,
+            "required_precomputed_evidence": precomputed,
+            "message_zh": (
+                f"该专业图需要用户提供{precomputed}；EditaPlot 只负责识别、排版和 Origin 绘图，"
+                "不会代做统计分析、模型解释或曲线拟合。"
+            ),
+        }
+        confirmation_questions.append(
+            {
+                "id": "precomputed_evidence",
+                "required": True,
+                "question_zh": f"请确认文件中的{precomputed}已经计算完成并经过你的科学审核。",
+            }
+        )
+
+    semantic_understanding: dict[str, Any] | None = None
+    if selected_template_id is not None:
+        try:
+            semantic_understanding = understand_data(
+                source_path,
+                template_id=selected_template_id,
+                engine_home=engine_home,
+            )
+        except EditaPlotError as exc:
+            if exc.code.startswith("source_changed"):
+                raise
+            semantic_understanding = {
+                "ok": False,
+                "state": "awaiting_column_meaning_correction",
+                "error": exc.to_dict()["error"],
+                "message_zh": "候选模板已找到，但需要先补充列含义或修正映射，才能生成可靠的元素清单。",
+            }
+        else:
+            if semantic_understanding["source"]["sha256"] != before_sha256:
+                raise EditaPlotError(
+                    "source_changed_during_start",
+                    "The source file changed while EditaPlot was interpreting it.",
+                )
+            confirmation_questions.append(
+                {
+                    "id": "semantic_element_checklist",
+                    "required": True,
+                    "question_zh": (
+                        "请核对元素清单：每列的用途、哪些元素需要绘制、哪些列只用于计算或验证、"
+                        "哪些列保留但不显示；确认正确后才能冻结绘图方案。"
+                    ),
+                }
+            )
+
+    return {
+        "schema_version": "1.0",
+        "session_type": "beginner_start",
+        "ok": True,
+        "state": "awaiting_scientific_confirmation",
+        "source": {
+            "file_name": Path(inspection["source"]["path"]).name,
+            "sha256": inspection["source"]["sha256"],
+            "size_bytes": inspection["source"]["size_bytes"],
+            "format": inspection["source"]["format"],
+            "row_count": inspection["table"]["row_count"],
+            "column_count": inspection["table"]["column_count"],
+            "bytes_unchanged": True,
+        },
+        "column_roles": column_roles,
+        "detected_layouts": inspection["table"]["layouts"],
+        "intent": intent,
+        "recommendation": {
+            "top_candidate": _beginner_candidate(top) if top else None,
+            "alternatives": [_beginner_candidate(candidate) for candidate in candidates[1:]],
+            "auto_selection_gate": {
+                **auto_gate,
+                "meaning_zh": (
+                    "候选模板可作为默认建议，但尚未获得科学目的确认。"
+                    if auto_gate["allowed"]
+                    else "不能自动选定模板，需要用户确认图表类型或列含义。"
+                ),
+            },
+        },
+        "requires_scientific_confirmation": True,
+        "confirmation_questions": confirmation_questions,
+        "semantic_understanding": semantic_understanding,
+        "professional_precomputed_notice": professional_notice,
+        "safe_defaults": {
+            "source_data": "只读检查；不修改、不补列、不覆盖原始文件。",
+            "helper_columns": "如绘图确有需要，只能在 Origin 工作簿内部创建 helper columns。",
+            "palette": "配色暂不锁定；模板和科学目的确认后再选择或接受色盲友好默认值。",
+            "origin": (
+                "数据识别阶段不调用 Origin；render 时直接测试本机 Automation 连接，失败只报告技术错误。"
+            ),
+            "analysis_boundary": "不推断统计检验、误差语义、拟合参数或模型输出。",
+        },
+        "execution": {
+            "plan_created": False,
+            "render_started": False,
+            "origin_called": False,
+        },
+        "next_step": {
+            "action": "collect_scientific_confirmations",
+            "message_zh": "请先回答上述确认问题；确认后 Skill 才能冻结绘图方案，随后再单独请求 Origin 渲染。",
+        },
+    }
+
+
+def _serialize(value: Any) -> Any:
+    if is_dataclass(value):
+        return {key: _serialize(item) for key, item in asdict(value).items()}
+    if isinstance(value, dict):
+        return {str(key): _serialize(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_serialize(item) for item in value]
+    if isinstance(value, Path):
+        return str(value)
+    return value
+
+
+def _confirm_semantic_proposal(
+    proposal: Any,
+    confirmation: dict[str, Any] | None,
+) -> Any:
+    if not isinstance(confirmation, dict):
+        raise EditaPlotError(
+            "semantic_confirmation_required",
+            "Review the data-understanding proposal and explicitly confirm it before planning.",
+            proposal_hash=proposal.proposal_hash,
+            confirmation_payload_template=_semantic_confirmation_template(proposal),
+        )
+    if confirmation.get("confirmed") is not True:
+        raise EditaPlotError(
+            "semantic_confirmation_required",
+            "The semantic confirmation must explicitly set confirmed=true.",
+            proposal_hash=proposal.proposal_hash,
+        )
+    supplied_hash = confirmation.get("proposal_hash")
+    if supplied_hash != proposal.proposal_hash:
+        raise EditaPlotError(
+            "semantic_proposal_hash_mismatch",
+            "The confirmed data understanding no longer matches the current source and mapping.",
+            expected_proposal_hash=proposal.proposal_hash,
+            supplied_proposal_hash=supplied_hash,
+        )
+    approved = confirmation.get("approved_derived_item_ids", [])
+    resolutions = confirmation.get("resolved_ambiguities", {})
+    if not isinstance(approved, list) or not all(isinstance(item, str) for item in approved):
+        raise EditaPlotError(
+            "semantic_confirmation_invalid",
+            "approved_derived_item_ids must be a JSON array of item IDs.",
+        )
+    if not isinstance(resolutions, dict) or not all(
+        isinstance(key, str) and isinstance(value, str) for key, value in resolutions.items()
+    ):
+        raise EditaPlotError(
+            "semantic_confirmation_invalid",
+            "resolved_ambiguities must be a JSON object of ambiguity IDs and selected answers.",
+        )
+    try:
+        return proposal.confirm(
+            user_confirmed=True,
+            approved_derived_item_ids=approved,
+            resolved_ambiguities=resolutions,
+        )
+    except Exception as exc:  # noqa: BLE001 - normalized semantic contract error
+        code = getattr(exc, "code", "semantic_confirmation_invalid")
+        details = getattr(exc, "details", {})
+        raise EditaPlotError(code, str(exc), **details) from exc
+
+
+def build_plan(
+    path: str | Path,
+    *,
+    template_id: str,
+    claim: str,
+    evidence_role: str,
+    target_output: str = "editable Origin figure and publication exports",
+    intent: str = "",
+    x_title: str | None = None,
+    y_title: str | None = None,
+    palette_id: str | None = None,
+    visual_style: dict[str, Any] | None = None,
+    mapping: dict[str, Any] | None = None,
+    semantic_confirmation: dict[str, Any] | None = None,
+    reference_image: str | Path | None = None,
+    reference_spec: dict[str, Any] | None = None,
+    reference_confirmation: dict[str, Any] | None = None,
+    reference_route: str = "template_adaptation",
+    reference_bindings: dict[str, str] | None = None,
+    engine_home: str | Path | None = None,
+) -> dict[str, Any]:
+    """Freeze a selected template preparation into a source-bound render plan."""
+    if not claim.strip():
+        raise EditaPlotError("claim_required", "A one-sentence figure claim is required.")
+    root = bootstrap_engine(engine_home)
+    try:
+        from origin_sciplot.origin_backend.template_capabilities import (
+            get_template_capability_profile,
+            resolve_activated_optional_capabilities,
+        )
+        from origin_sciplot.palette_catalog import get_palette, palette_to_dict
+        from origin_sciplot.scientific_workflow import (
+            apply_scientific_palette_override,
+            apply_scientific_text_overrides,
+        )
+        from origin_sciplot.template_service import TemplateServiceError, TemplateServiceRegistry
+    except Exception as exc:  # noqa: BLE001
+        raise EditaPlotError("engine_import_failed", f"Could not import template services: {exc}") from exc
+
+    registry = TemplateServiceRegistry()
+    try:
+        service = registry.get(template_id)
+        prepared = service.prepare(path)
+        if mapping is not None:
+            assignments = mapping.get("assignments")
+            if not isinstance(assignments, dict):
+                raise EditaPlotError("mapping_invalid", "Mapping JSON needs an assignments object.")
+            context = str(mapping.get("energy_kind") or mapping.get("plot_mode") or "")
+            prepared = service.confirm_mapping(
+                prepared,
+                assignments={str(key): str(value) for key, value in assignments.items()},
+                energy_kind=context,
+            )
+    except TemplateServiceError as exc:
+        raise EditaPlotError(exc.code, str(exc)) from exc
+
+    semantic_proposal = _proposal_for_prepared(
+        prepared,
+        template_id=template_id,
+        source_path=path,
+    )
+    worker_mapping = service.worker_mapping(prepared)
+    frozen_payload = prepared.payload
+    explicit_visual_tokens = dict(visual_style or {})
+    if palette_id is not None:
+        existing_palette = explicit_visual_tokens.get("palette_id")
+        if existing_palette is not None and existing_palette != palette_id:
+            raise EditaPlotError(
+                "visual_style_conflict",
+                "palette_id conflicts with visual_style.palette_id.",
+            )
+        explicit_visual_tokens["palette_id"] = palette_id
+    explicit_visual_report: dict[str, Any] | None = None
+    axis_title_overrides = {
+        key: value for key, value in (("x_title", x_title), ("y_title", y_title)) if value is not None
+    }
+    if axis_title_overrides:
+        if template_id == "xps":
+            raise EditaPlotError(
+                "text_overrides_unsupported",
+                "Axis-title overrides are currently available for scientific-table templates only.",
+            )
+        try:
+            frozen_payload = apply_scientific_text_overrides(
+                frozen_payload,
+                x_title=x_title,
+                y_title=y_title,
+            )
+        except Exception as exc:  # noqa: BLE001 - normalize engine validation errors
+            code = getattr(exc, "code", "text_overrides_invalid")
+            raise EditaPlotError(code, str(exc)) from exc
+    palette_contract: dict[str, Any] = {}
+    if template_id == "xps" and explicit_visual_tokens:
+        try:
+            from origin_sciplot.xps_visual_style import apply_xps_visual_style
+
+            visual_application = apply_xps_visual_style(
+                frozen_payload,
+                explicit_visual_tokens,
+                source="explicit_user",
+            )
+        except Exception as exc:  # noqa: BLE001 - normalized visual contract error
+            code = getattr(exc, "code", "xps_visual_style_invalid")
+            raise EditaPlotError(code, str(exc)) from exc
+        frozen_payload = visual_application.preparation
+        explicit_visual_report = visual_application.report
+        # Freeze and forward the adapter's canonical form (normalised HEX,
+        # numeric values and deterministic key ordering), never the raw CLI
+        # object.  The report hash is computed over this exact representation.
+        explicit_visual_tokens = dict(explicit_visual_report["requested_tokens"])
+        selected_palette = explicit_visual_tokens.get("palette_id")
+        if selected_palette is not None:
+            try:
+                palette_contract = palette_to_dict(get_palette(str(selected_palette)))
+            except (KeyError, ValueError):
+                # The style report already records a rejected palette and the
+                # retained semantic default; do not mislabel it as applied.
+                palette_contract = {}
+    elif visual_style and template_id != "xps":
+        raise EditaPlotError(
+            "visual_style_template_unsupported",
+            "Exact visual_style fields are currently implemented for XPS only; "
+            "use --palette-id for non-XPS templates.",
+            unsupported_fields=sorted(explicit_visual_tokens),
+        )
+    if palette_id is not None and template_id != "xps":
+        try:
+            frozen_payload = apply_scientific_palette_override(
+                frozen_payload,
+                palette_id=palette_id,
+            )
+            palette_contract = palette_to_dict(get_palette(palette_id))
+            # Non-XPS palettes keep using the established palette contract;
+            # do not mislabel them as an XPS exact-visual request.
+            explicit_visual_tokens = {}
+        except Exception as exc:  # noqa: BLE001 - normalize engine validation errors
+            code = getattr(exc, "code", "palette_invalid")
+            raise EditaPlotError(code, str(exc)) from exc
+    plot_spec = getattr(frozen_payload, "plot_spec", None)
+    display_transform = getattr(plot_spec, "display_transform", "identity") if plot_spec else "identity"
+    if hasattr(plot_spec, "visual_profile"):
+        display_transform = plot_spec.visual_profile
+    capability_profile = get_template_capability_profile(template_id)
+    try:
+        activated_optional_capabilities = resolve_activated_optional_capabilities(
+            template_id,
+            plot_spec,
+        )
+    except ValueError as exc:
+        raise EditaPlotError(
+            "origin_capability_profile_invalid",
+            str(exc),
+        ) from exc
+
+    summary_facts = [list(item) for item in prepared.summary.facts]
+    if plot_spec is not None and axis_title_overrides:
+        for fact in summary_facts:
+            if fact[0] == "X 轴":
+                fact[1] = plot_spec.x_title
+            elif fact[0] == "Y 轴":
+                fact[1] = plot_spec.y_title
+
+    semantic_contract = _confirm_semantic_proposal(
+        semantic_proposal,
+        semantic_confirmation,
+    )
+    reference_values = (reference_image, reference_spec, reference_confirmation)
+    reference_requested = any(value is not None for value in reference_values)
+    if reference_requested and not all(value is not None for value in reference_values):
+        raise EditaPlotError(
+            "reference_inputs_incomplete",
+            "Reference adaptation needs an image, a reviewed spec, and explicit confirmation.",
+        )
+    reference_adaptation: dict[str, Any] | None = None
+    reference_style_report: dict[str, Any] | None = None
+    reference_renderer_ready = True
+    reference_blocked_reasons: list[str] = []
+    if reference_requested:
+        if reference_image is None or reference_spec is None or reference_confirmation is None:
+            raise EditaPlotError(
+                "reference_inputs_incomplete",
+                "Reference adaptation needs an image, a reviewed spec, and explicit confirmation.",
+            )
+        confirmed_reference = _confirm_reference_spec(
+            reference_image,
+            reference_spec,
+            reference_confirmation,
+        )
+        try:
+            from origin_sciplot.reference_adaptation import (
+                build_reference_adaptation_plan,
+            )
+
+            adaptation = build_reference_adaptation_plan(
+                semantic_contract,
+                confirmed_reference,
+                route=reference_route,
+                template_id=template_id if reference_route == "template_adaptation" else None,
+                semantic_bindings=reference_bindings,
+            )
+        except Exception as exc:  # noqa: BLE001
+            code = getattr(exc, "code", "reference_adaptation_invalid")
+            raise EditaPlotError(code, str(exc)) from exc
+        reference_adaptation = adaptation.to_dict()
+        required_reference_capabilities = set(
+            reference_adaptation["origin_capability_gate"]["additional_required_capabilities"]
+        )
+        allowed_reference_capabilities = {
+            capability.value for capability in (capability_profile.required | capability_profile.optional)
+        }
+        unavailable = sorted(required_reference_capabilities - allowed_reference_capabilities)
+        if unavailable:
+            raise EditaPlotError(
+                "reference_capability_unavailable",
+                "The selected Origin template cannot reproduce all essential reference primitives.",
+                unavailable_capabilities=unavailable,
+            )
+        try:
+            from origin_sciplot.reference_style import apply_reference_style
+
+            style_application = apply_reference_style(
+                frozen_payload,
+                reference_adaptation,
+                locked_palette_id=palette_id,
+                locked_style_tokens=explicit_visual_tokens,
+            )
+        except Exception as exc:  # noqa: BLE001
+            code = getattr(exc, "code", "reference_style_invalid")
+            raise EditaPlotError(code, str(exc)) from exc
+        frozen_payload = style_application.preparation
+        reference_style_report = style_application.report
+        reference_renderer_ready = bool(reference_style_report["execution_allowed"])
+        reference_blocked_reasons.extend(
+            str(item) for item in reference_style_report.get("blocking_reasons", [])
+        )
+    plan: dict[str, Any] = {
+        "plan_version": PLAN_VERSION,
+        "product": "EditaPlot",
+        "support_level": "verified" if template_id in VERIFIED_TEMPLATE_IDS else "experimental",
+        "source": {
+            "path": prepared.source_path,
+            "sha256": getattr(prepared.payload, "source_sha256", _sha256(Path(prepared.source_path))),
+            "size_bytes": prepared.source_size_bytes,
+            "format": prepared.source_format,
+            "sheet": prepared.source_sheet,
+            "columns": list(prepared.source_columns),
+            "row_count": prepared.row_count,
+        },
+        "figure_contract": {
+            "core_conclusion": claim.strip(),
+            "evidence_role": evidence_role.strip() or "unspecified",
+            "user_intent": intent.strip(),
+            "target_output": target_output.strip(),
+            "axis_title_overrides": axis_title_overrides,
+            "palette": palette_contract,
+            "visual_style": {
+                "tokens": explicit_visual_tokens,
+                "report": explicit_visual_report,
+            },
+        },
+        "data_understanding": semantic_contract.to_dict(),
+        "reference_adaptation": reference_adaptation,
+        "reference_style": reference_style_report,
+        "template": {
+            "id": template_id,
+            "name": service.manifest.name,
+            "renderer_template_id": prepared.renderer_template_id,
+            "plan_digest": getattr(frozen_payload, "plan_digest", prepared.plan_digest),
+            "confidence": float(prepared.confidence),
+            "requires_confirmation": bool(prepared.requires_confirmation),
+            "summary": {
+                "heading": prepared.summary.heading,
+                "facts": summary_facts,
+                "roles": [list(item) for item in prepared.summary.roles],
+                "components": list(prepared.summary.components),
+                "warnings": list(prepared.summary.warnings),
+            },
+            "display_transform_or_profile": display_transform,
+            "worker_mapping": _serialize(worker_mapping),
+            "origin_capability_profile": capability_profile.to_dict(),
+            "activated_optional_capabilities": sorted(
+                capability.value for capability in activated_optional_capabilities
+            ),
+        },
+        "execution": {
+            "engine_home": str(root),
+            "keep_origin_open": True,
+            "origin_callability_check": "performed_by_render_worker",
+            "output_directory_policy": "source_sibling_unique_folder",
+            "output_folder_pattern": "<source_stem>_EditaPlot_YYYYMMDD_HHMMSS",
+            "render_plan_copy": "render-plan.json",
+            "required_outputs": ["opju", "png", "pdf", "tif", "origin_verify_report"],
+        },
+        "can_render": bool(
+            template_id in VERIFIED_TEMPLATE_IDS
+            and not prepared.requires_confirmation
+            and reference_renderer_ready
+        ),
+        "blocked_reasons": (
+            (["column_mapping_confirmation_required"] if prepared.requires_confirmation else [])
+            + reference_blocked_reasons
+        ),
+    }
+    plan["plan_hash"] = _json_hash(plan)
+    return plan
+
+
+def _validate_frozen_semantic_contract(
+    payload: Any,
+    *,
+    source_sha256: str,
+) -> None:
+    if not isinstance(payload, dict):
+        raise EditaPlotError(
+            "semantic_contract_missing",
+            "The render plan has no confirmed data-understanding contract.",
+        )
+    try:
+        from origin_sciplot.semantic_contract import (
+            SemanticContractError,
+            parse_confirmed_semantic_contract,
+        )
+
+        contract = parse_confirmed_semantic_contract(payload)
+    except ImportError as exc:
+        raise EditaPlotError(
+            "semantic_contract_parser_unavailable",
+            "The rendering engine cannot validate the frozen data-understanding contract.",
+        ) from exc
+    except SemanticContractError as exc:
+        raise EditaPlotError(
+            getattr(exc, "code", "semantic_contract_invalid"),
+            str(exc),
+            **getattr(exc, "details", {}),
+        ) from exc
+    if contract.proposal.source_sha256 != source_sha256:
+        raise EditaPlotError(
+            "semantic_contract_source_mismatch",
+            "The data-understanding contract belongs to a different source snapshot.",
+        )
+
+
+def validate_plan(plan: dict[str, Any]) -> None:
+    if plan.get("plan_version") != PLAN_VERSION:
+        raise EditaPlotError("plan_version_unsupported", "Unsupported render-plan version.")
+    expected_hash = plan.get("plan_hash")
+    payload = dict(plan)
+    payload.pop("plan_hash", None)
+    if not isinstance(expected_hash, str) or expected_hash != _json_hash(payload):
+        raise EditaPlotError("plan_hash_mismatch", "The render plan was modified after creation.")
+    source_payload = plan.get("source")
+    if not isinstance(source_payload, dict) or not isinstance(source_payload.get("sha256"), str):
+        raise EditaPlotError("source_contract_missing", "The render plan has no source contract.")
+    _validate_frozen_semantic_contract(
+        plan.get("data_understanding"),
+        source_sha256=str(source_payload["sha256"]),
+    )
+    reference_adaptation = plan.get("reference_adaptation")
+    reference_style = plan.get("reference_style")
+    visual_style = plan.get("figure_contract", {}).get("visual_style")
+    if isinstance(visual_style, dict) and visual_style.get("tokens"):
+        visual_report = visual_style.get("report")
+        if not isinstance(visual_report, dict):
+            raise EditaPlotError(
+                "xps_visual_style_report_missing",
+                "The render plan has no frozen explicit XPS visual-style report.",
+            )
+        report_payload = dict(visual_report)
+        report_hash = report_payload.pop("report_hash", None)
+        expected_output_digest = (
+            reference_style.get("input_plan_digest")
+            if isinstance(reference_style, dict)
+            else plan.get("template", {}).get("plan_digest")
+        )
+        if (
+            not isinstance(report_hash, str)
+            or report_hash != _json_hash(report_payload)
+            or visual_style.get("tokens") != visual_report.get("requested_tokens")
+            or visual_report.get("output_plan_digest") != expected_output_digest
+        ):
+            raise EditaPlotError(
+                "xps_visual_style_report_mismatch",
+                "The explicit XPS visual-style report does not match the render plan.",
+            )
+    if reference_adaptation is not None:
+        if not isinstance(reference_adaptation, dict) or not isinstance(
+            reference_style,
+            dict,
+        ):
+            raise EditaPlotError(
+                "reference_style_report_missing",
+                "The render plan has no frozen reference-style report.",
+            )
+        reference_report_payload = dict(reference_style)
+        reference_report_hash = reference_report_payload.pop("report_hash", None)
+        if (
+            not isinstance(reference_report_hash, str)
+            or reference_report_hash != _json_hash(reference_report_payload)
+            or reference_style.get("reference_plan_hash") != reference_adaptation.get("plan_hash")
+            or reference_style.get("output_plan_digest") != plan.get("template", {}).get("plan_digest")
+        ):
+            raise EditaPlotError(
+                "reference_style_report_mismatch",
+                "The frozen reference-style report does not match the render plan.",
+            )
+    if not plan.get("can_render"):
+        raise EditaPlotError(
+            "plan_blocked",
+            "The render plan still requires confirmation.",
+            blocked_reasons=plan.get("blocked_reasons", []),
+        )
+    source = Path(str(plan["source"]["path"]))
+    if not source.is_file():
+        raise EditaPlotError("source_missing", "The planned source file no longer exists.")
+    if _sha256(source) != str(plan["source"]["sha256"]):
+        raise EditaPlotError("source_changed", "The source file changed after planning.")
+
+
+def build_worker_command(
+    plan: dict[str, Any],
+    *,
+    plan_file: str | Path | None = None,
+    engine_home: str | Path | None = None,
+    python_executable: str | Path | None = None,
+    output_dir: str | Path | None = None,
+    close_origin: bool = False,
+) -> tuple[list[str], dict[str, str], Path]:
+    execution = plan.get("execution")
+    planned_engine_home = execution.get("engine_home") if isinstance(execution, dict) else None
+    root = bootstrap_engine(engine_home or planned_engine_home)
+    validate_plan(plan)
+    python = str(python_executable or os.environ.get("EDITAPLOT_PYTHON") or sys.executable)
+    command = [
+        python,
+        "-m",
+        "origin_sciplot.workers.run_template_worker",
+        "--template-id",
+        str(plan["template"]["id"]),
+        "--input-file",
+        str(plan["source"]["path"]),
+        "--expected-plan-digest",
+        str(plan["template"]["plan_digest"]),
+        "--close-origin" if close_origin else "--keep-origin-open",
+    ]
+    if output_dir:
+        command.extend(("--output-dir", str(Path(output_dir).resolve())))
+    if plan_file:
+        command.extend(("--render-plan-file", str(Path(plan_file).resolve())))
+    mapping = plan["template"].get("worker_mapping")
+    if mapping:
+        command.extend(("--column-mapping-json", json.dumps(mapping, ensure_ascii=False)))
+    text_overrides = plan.get("figure_contract", {}).get("axis_title_overrides")
+    if text_overrides:
+        command.extend(("--text-overrides-json", json.dumps(text_overrides, ensure_ascii=False)))
+    palette = plan.get("figure_contract", {}).get("palette")
+    if isinstance(palette, dict) and palette.get("palette_id"):
+        command.extend(("--palette-id", str(palette["palette_id"])))
+    visual_style = plan.get("figure_contract", {}).get("visual_style")
+    visual_tokens: dict[str, Any] = {}
+    if isinstance(visual_style, dict) and isinstance(visual_style.get("tokens"), dict):
+        visual_tokens = dict(visual_style["tokens"])
+        visual_report = visual_style.get("report")
+        if visual_tokens:
+            if not isinstance(visual_report, dict) or not isinstance(
+                visual_report.get("report_hash"),
+                str,
+            ):
+                raise EditaPlotError(
+                    "xps_visual_style_report_missing",
+                    "The render plan has no frozen explicit XPS visual-style report.",
+                )
+            command.extend(
+                (
+                    "--visual-style-json",
+                    json.dumps(
+                        {
+                            "tokens": visual_tokens,
+                            "expected_report_hash": visual_report["report_hash"],
+                        },
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    ),
+                )
+            )
+    reference_adaptation = plan.get("reference_adaptation")
+    reference_style = plan.get("reference_style")
+    if isinstance(reference_adaptation, dict):
+        if not isinstance(reference_style, dict) or not isinstance(
+            reference_style.get("report_hash"),
+            str,
+        ):
+            raise EditaPlotError(
+                "reference_style_report_missing",
+                "The render plan has no frozen reference-style report.",
+            )
+        command.extend(
+            (
+                "--reference-style-json",
+                json.dumps(
+                    {
+                        "adaptation": reference_adaptation,
+                        "expected_report_hash": reference_style["report_hash"],
+                        "locked_palette_id": (
+                            str(palette["palette_id"])
+                            if isinstance(palette, dict) and palette.get("palette_id")
+                            else None
+                        ),
+                        "locked_style_tokens": visual_tokens,
+                    },
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ),
+            )
+        )
+    env = dict(os.environ)
+    source_path = str(root / "src")
+    env["PYTHONPATH"] = source_path + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
+    env["PYTHONIOENCODING"] = "utf-8"
+    return command, env, root
+
+
+def build_origin_smoke_command(
+    *,
+    output_dir: str | Path,
+    engine_home: str | Path | None = None,
+    python_executable: str | Path | None = None,
+    keep_origin_open: bool = False,
+) -> tuple[list[str], dict[str, str], Path]:
+    """Build a safe subprocess command for an isolated Origin smoke test."""
+
+    root = bootstrap_engine(engine_home)
+    target = Path(output_dir).expanduser().resolve()
+    python = str(python_executable or os.environ.get("EDITAPLOT_PYTHON") or sys.executable)
+    command = [
+        python,
+        "-m",
+        "origin_sciplot.workers.origin_smoke_worker",
+        "--output-dir",
+        str(target),
+        "--keep-origin-open" if keep_origin_open else "--close-origin",
+    ]
+    env = dict(os.environ)
+    source_path = str(root / "src")
+    env["PYTHONPATH"] = source_path + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
+    env["PYTHONIOENCODING"] = "utf-8"
+    return command, env, root
+
+
+def _medical_panel_layout(panel_count: int, hero_panel: int | None) -> dict[str, Any]:
+    """Freeze a compact publication layout without touching panel pixels."""
+    if hero_panel is not None and panel_count in {3, 5}:
+        rows = 2 if panel_count == 3 else 3
+        columns = 2
+        slots = [
+            {
+                "panel_index": hero_panel,
+                "row": 0,
+                "column": 0,
+                "row_span": 1,
+                "column_span": 2,
+            }
+        ]
+        remaining = [index for index in range(panel_count) if index != hero_panel]
+        for slot_index, panel_index in enumerate(remaining):
+            slots.append(
+                {
+                    "panel_index": panel_index,
+                    "row": 1 + slot_index // 2,
+                    "column": slot_index % 2,
+                    "row_span": 1,
+                    "column_span": 1,
+                }
+            )
+        profile = "hero-wide"
+    else:
+        columns = 2 if panel_count <= 4 else 3
+        rows = int(math.ceil(panel_count / columns))
+        slots = [
+            {
+                "panel_index": index,
+                "row": index // columns,
+                "column": index % columns,
+                "row_span": 1,
+                "column_span": 1,
+            }
+            for index in range(panel_count)
+        ]
+        profile = f"grid-{rows}x{columns}"
+    panel_width_cm = 8.4
+    panel_height_cm = 6.4
+    gap_cm = 0.45
+    outer_margin_cm = 0.70
+    return {
+        "profile": profile,
+        "rows": rows,
+        "columns": columns,
+        "slots": slots,
+        "page_width_cm": round(
+            columns * panel_width_cm + (columns - 1) * gap_cm + 2 * outer_margin_cm,
+            2,
+        ),
+        "page_height_cm": round(
+            rows * panel_height_cm + (rows - 1) * gap_cm + 2 * outer_margin_cm,
+            2,
+        ),
+        "panel_gap_cm": gap_cm,
+        "outer_margin_cm": outer_margin_cm,
+        "panel_label_size_pt": 18.0,
+        "caption_size_pt": 14.0,
+    }
+
+
+def _medical_image_signature_ok(path: Path) -> bool:
+    with path.open("rb") as stream:
+        header = stream.read(8)
+    suffix = path.suffix.casefold()
+    if suffix == ".png":
+        return header == b"\x89PNG\r\n\x1a\n"
+    if suffix in {".jpg", ".jpeg"}:
+        return header.startswith(b"\xff\xd8\xff")
+    if suffix in {".tif", ".tiff"}:
+        return header.startswith((b"II*\x00", b"MM\x00*"))
+    return False
+
+
+def build_medical_panel_plan(
+    config_path: str | Path,
+    *,
+    claim: str,
+    title: str = "Medical imaging & AI evidence",
+) -> dict[str, Any]:
+    """Validate and freeze a deidentification-aware multi-panel layout plan.
+
+    This is deliberately a composition gate, not a new Origin renderer.  It
+    accepts only verified quantitative Origin outputs and user-attested,
+    deidentified image panels.  It never OCRs, crops, windows, resamples, or
+    modifies medical images.
+    """
+    config_file = Path(config_path).expanduser().resolve()
+    config = load_json(config_file)
+    panels = config.get("panels")
+    if not isinstance(panels, list) or not 2 <= len(panels) <= 9:
+        raise EditaPlotError(
+            "medical_panel_count",
+            "A medical panel plan needs 2 to 9 panel objects.",
+        )
+    hero_raw = config.get("hero_panel")
+    hero_panel = None if hero_raw is None else int(hero_raw)
+    if hero_panel is not None and not 0 <= hero_panel < len(panels):
+        raise EditaPlotError("medical_hero_panel", "hero_panel is outside the panel list.")
+
+    blocked: list[str] = []
+    panel_records: list[dict[str, Any]] = []
+    image_count = 0
+    quantitative_count = 0
+    for index, raw in enumerate(panels):
+        if not isinstance(raw, dict):
+            raise EditaPlotError("medical_panel_object", f"Panel {index + 1} must be an object.")
+        kind = str(raw.get("kind", "")).strip().casefold()
+        panel_title = str(raw.get("title", "")).strip()
+        evidence_role = str(raw.get("evidence_role", "")).strip()
+        source_value = raw.get("source")
+        if kind not in {"quantitative", "image"}:
+            raise EditaPlotError(
+                "medical_panel_kind",
+                f"Panel {index + 1} kind must be quantitative or image.",
+            )
+        if not panel_title or not evidence_role or not isinstance(source_value, str):
+            raise EditaPlotError(
+                "medical_panel_metadata",
+                f"Panel {index + 1} needs title, evidence_role, and source.",
+            )
+        source_candidate = Path(source_value).expanduser()
+        source = (
+            source_candidate if source_candidate.is_absolute() else config_file.parent / source_candidate
+        ).resolve()
+        record: dict[str, Any] = {
+            "index": index,
+            "label": chr(ord("A") + index),
+            "kind": kind,
+            "title": panel_title,
+            "evidence_role": evidence_role,
+            "source": str(source),
+        }
+        if kind == "quantitative":
+            quantitative_count += 1
+            verification = verify_output(source)
+            report_path = source / "origin_verify_report.json"
+            report = load_json(report_path) if report_path.is_file() else {}
+            template_id = str(report.get("template_id", ""))
+            if not verification["programmatic_pass"]:
+                blocked.append(f"panel_{index + 1}_origin_verification_failed")
+            if template_id not in VERIFIED_TEMPLATE_IDS:
+                blocked.append(f"panel_{index + 1}_route_not_verified")
+            if str(raw.get("human_visual_qa", "")).casefold() != "pass":
+                blocked.append(f"panel_{index + 1}_human_visual_qa_required")
+            artifacts = verification["artifacts"]
+            record.update(
+                {
+                    "template_id": template_id,
+                    "origin_programmatic_pass": bool(verification["programmatic_pass"]),
+                    "human_visual_qa": str(raw.get("human_visual_qa", "")),
+                    "preview_png": artifacts["png"]["path"],
+                    "preview_sha256": _sha256(Path(artifacts["png"]["path"]))
+                    if artifacts["png"]["ok"]
+                    else None,
+                    "editable_opju": artifacts["opju"]["path"],
+                    "opju_sha256": _sha256(Path(artifacts["opju"]["path"]))
+                    if artifacts["opju"]["ok"]
+                    else None,
+                    "origin_report_sha256": _sha256(report_path) if report_path.is_file() else None,
+                }
+            )
+        else:
+            image_count += 1
+            if not source.is_file():
+                raise EditaPlotError(
+                    "medical_image_missing",
+                    f"Image panel source does not exist: {source}",
+                )
+            if source.suffix.casefold() not in {".png", ".jpg", ".jpeg", ".tif", ".tiff"}:
+                raise EditaPlotError(
+                    "medical_image_format",
+                    "Medical image panels must be PNG, JPEG, or TIFF.",
+                )
+            if not _medical_image_signature_ok(source):
+                raise EditaPlotError(
+                    "medical_image_signature",
+                    "Medical image content does not match its PNG, JPEG, or TIFF extension.",
+                )
+            if raw.get("deidentified") is not True:
+                blocked.append(f"panel_{index + 1}_deidentification_attestation_required")
+            if raw.get("burned_in_text_checked") is not True:
+                blocked.append(f"panel_{index + 1}_burned_in_text_check_required")
+            modality = str(raw.get("modality", "")).strip()
+            plane = str(raw.get("plane", "")).strip()
+            display_parameters = str(raw.get("display_parameters", "")).strip()
+            if not modality or not plane or not display_parameters:
+                blocked.append(f"panel_{index + 1}_imaging_metadata_required")
+            record.update(
+                {
+                    "sha256": _sha256(source),
+                    "deidentified": raw.get("deidentified") is True,
+                    "burned_in_text_checked": raw.get("burned_in_text_checked") is True,
+                    "modality": modality,
+                    "plane": plane,
+                    "display_parameters": display_parameters,
+                    "scale_bar": str(raw.get("scale_bar", "not supplied")),
+                    "annotation_meaning": str(raw.get("annotation_meaning", "none")),
+                    "pixel_transform": "none_in_panel_planner",
+                }
+            )
+        panel_records.append(record)
+
+    shared_legend = bool(config.get("shared_legend", False))
+    if shared_legend and config.get("shared_semantics_confirmed") is not True:
+        blocked.append("shared_legend_semantics_confirmation_required")
+    if len({item["evidence_role"].casefold() for item in panel_records}) != len(panel_records):
+        blocked.append("each_panel_needs_unique_evidence_role")
+    condition_color_map = config.get("condition_color_map")
+    valid_condition_color_map = bool(condition_color_map) and isinstance(condition_color_map, dict)
+    if valid_condition_color_map:
+        valid_condition_color_map = all(
+            str(condition).strip() and str(color).strip() for condition, color in condition_color_map.items()
+        )
+    if quantitative_count > 1 and not valid_condition_color_map:
+        blocked.append("condition_color_map_required_for_multiple_quantitative_panels")
+    layout = _medical_panel_layout(len(panel_records), hero_panel)
+    payload: dict[str, Any] = {
+        "plan_version": MEDICAL_PANEL_PLAN_VERSION,
+        "product": "EditaPlot",
+        "plan_type": "medical_multi_panel_composition",
+        "support_level": "verified_inputs_planning_only",
+        "title": title.strip() or "Medical imaging & AI evidence",
+        "claim": claim.strip(),
+        "config": {
+            "path": str(config_file),
+            "sha256": _sha256(config_file),
+        },
+        "panel_count": len(panel_records),
+        "quantitative_panel_count": quantitative_count,
+        "image_panel_count": image_count,
+        "panels": panel_records,
+        "layout": layout,
+        "semantic_contract": {
+            "condition_color_map": condition_color_map if valid_condition_color_map else {},
+            "shared_legend": shared_legend,
+            "shared_semantics_confirmed": config.get("shared_semantics_confirmed") is True,
+            "each_panel_has_unique_evidence_role": len(
+                {item["evidence_role"].casefold() for item in panel_records}
+            )
+            == len(panel_records),
+        },
+        "deidentification_gate": {
+            "automatic_phi_detection_performed": False,
+            "user_attestation_required": image_count > 0,
+            "all_image_attestations_pass": not any(
+                "deidentification" in item or "burned_in_text" in item for item in blocked
+            ),
+        },
+        "composition_backend": {
+            "status": "layout_plan_only",
+            "origin_subprojects_remain_editable": True,
+            "merged_origin_opju_claimed": False,
+            "medical_image_processing_performed": False,
+        },
+        "can_compose": not blocked and bool(claim.strip()),
+        "blocked_reasons": list(
+            dict.fromkeys(blocked or (["core_claim_required"] if not claim.strip() else []))
+        ),
+    }
+    payload["plan_hash"] = _json_hash(payload)
+    return payload
+
+
+def _managed_python(root: Path) -> Path:
+    return _environment_python(root / MANAGED_ENV_DIRECTORY)
+
+
+@contextmanager
+def _exclusive_environment_lock(root: Path) -> Iterator[None]:
+    """Serialize repairs without stale PID files; the OS releases this lock on exit."""
+
+    lock_path = root / MANAGED_ENV_LOCK
+    handle: BinaryIO = lock_path.open("a+b")
+    handle.seek(0)
+    if handle.read(1) != b"1":
+        handle.seek(0)
+        handle.write(b"1")
+        handle.flush()
+    handle.seek(0)
+    locked = False
+    try:
+        if os.name == "nt":
+            import msvcrt
+
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+        else:  # pragma: no cover - production support is Windows; used by cross-platform tests
+            import fcntl
+
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        locked = True
+    except OSError as exc:
+        handle.close()
+        raise EditaPlotError(
+            "environment_repair_in_progress",
+            "Another EditaPlot process is already repairing this managed environment.",
+            engine_home=str(root),
+        ) from exc
+    try:
+        yield
+    finally:
+        if locked:
+            handle.seek(0)
+            if os.name == "nt":
+                import msvcrt
+
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            else:  # pragma: no cover - production support is Windows
+                import fcntl
+
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        handle.close()
+
+
+def _environment_python(environment: Path) -> Path:
+    scripts = "Scripts" if platform.system() == "Windows" else "bin"
+    executable = "python.exe" if platform.system() == "Windows" else "python"
+    return environment / scripts / executable
+
+
+def _probe_python_executable(python: Path) -> dict[str, Any]:
+    probe = (
+        "import json,platform,struct,sys;"
+        "print(json.dumps({'executable':sys.executable,'implementation':"
+        "platform.python_implementation(),'version':list(sys.version_info[:3]),"
+        "'architecture_bits':struct.calcsize('P')*8}))"
+    )
+    try:
+        completed = subprocess.run(  # noqa: S603 - probing a selected local Python executable
+            [str(python), "-I", "-c", probe],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+            timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return {"ok": False, "error": type(exc).__name__}
+    if completed.returncode != 0:
+        return {"ok": False, "error": "probe_failed", "returncode": completed.returncode}
+    try:
+        raw = json.loads(completed.stdout.strip().splitlines()[-1])
+        compatibility = python_compatibility(
+            version=tuple(int(part) for part in raw["version"]),
+            implementation=str(raw["implementation"]),
+            architecture_bits=int(raw["architecture_bits"]),
+        )
+    except (IndexError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        return {"ok": False, "error": f"invalid_probe_output:{type(exc).__name__}"}
+    return {"ok": True, "executable": str(raw["executable"]), **compatibility}
+
+
+def managed_environment_status(root: Path) -> dict[str, Any]:
+    """Validate the dedicated environment without importing packages from it."""
+
+    resolved_root = root.expanduser().resolve()
+    env_root = resolved_root / MANAGED_ENV_DIRECTORY
+    python = _managed_python(resolved_root)
+    fingerprint_path = env_root / MANAGED_ENV_FINGERPRINT
+    result: dict[str, Any] = {
+        "exists": env_root.exists() or env_root.is_symlink(),
+        "valid": False,
+        "environment": str(env_root),
+        "python_executable": str(python),
+        "fingerprint": str(fingerprint_path),
+    }
+    if not result["exists"]:
+        return {**result, "reason": "managed_environment_missing"}
+    if env_root.is_symlink() or not env_root.is_dir():
+        return {**result, "reason": "managed_environment_not_a_dedicated_directory"}
+    if not python.is_file():
+        return {**result, "reason": "managed_python_missing"}
+    if not fingerprint_path.is_file():
+        return {**result, "reason": "managed_fingerprint_missing"}
+    lock = Path(__file__).with_name("requirements-runtime.lock")
+    if not lock.is_file():
+        return {**result, "reason": "dependency_lock_missing"}
+    try:
+        fingerprint = json.loads(fingerprint_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {**result, "reason": "managed_fingerprint_invalid"}
+    result = {
+        **result,
+        "dependency_lock_sha256": fingerprint.get("dependency_lock_sha256"),
+    }
+    if fingerprint.get("schema_version") != "1.0":
+        return {**result, "reason": "managed_fingerprint_schema_mismatch"}
+    if fingerprint.get("dependency_lock_sha256") != _sha256(lock):
+        return {**result, "reason": "dependency_lock_changed"}
+    if fingerprint.get("dependency_policy_sha256") != _dependency_policy_hash():
+        return {**result, "reason": "dependency_policy_changed"}
+    probe = _probe_python_executable(python)
+    if not probe.get("ok"):
+        return {**result, "reason": "managed_python_unusable", "probe": probe}
+    if not probe.get("compatible"):
+        return {**result, "reason": "managed_python_incompatible", "probe": probe}
+    if fingerprint.get("managed_python_version") != probe.get("version"):
+        return {**result, "reason": "managed_python_version_changed", "probe": probe}
+    expected_python = os.path.normcase(str(python.resolve()))
+    actual_python = os.path.normcase(str(Path(str(probe["executable"])).resolve()))
+    if expected_python != actual_python:
+        return {**result, "reason": "managed_python_path_changed", "probe": probe}
+    dependency_check = _verify_managed_dependencies(python)
+    if not dependency_check["ok"]:
+        return {
+            **result,
+            "reason": "managed_dependencies_changed",
+            "probe": probe,
+            "dependency_status": dependency_check,
+        }
+    return {
+        **result,
+        "valid": True,
+        "reason": "ready",
+        "probe": probe,
+        "base_python_executable": fingerprint.get("base_python_executable"),
+        "dependency_lock_sha256": fingerprint.get("dependency_lock_sha256"),
+    }
+
+
+def _validated_managed_child(root: Path, path: Path) -> Path:
+    """Accept only EditaPlot-owned direct children of the resolved engine root."""
+
+    resolved_root = root.expanduser().resolve()
+    candidate = path.expanduser()
+    allowed_name = (
+        candidate.name == MANAGED_ENV_DIRECTORY
+        or candidate.name.startswith(MANAGED_ENV_BUILD_PREFIX)
+        or candidate.name.startswith(MANAGED_ENV_STALE_PREFIX)
+    )
+    try:
+        direct_child = candidate.parent.resolve() == resolved_root
+    except OSError as exc:
+        raise EditaPlotError(
+            "managed_path_validation_failed",
+            "Could not validate an EditaPlot-managed path.",
+            path=str(candidate),
+        ) from exc
+    if not allowed_name or not direct_child:
+        raise EditaPlotError(
+            "managed_path_outside_engine_root",
+            "Refusing to modify a path outside EditaPlot's managed engine-root entries.",
+            path=str(candidate),
+            engine_home=str(resolved_root),
+        )
+    if candidate.exists() and not candidate.is_symlink():
+        try:
+            resolved_candidate = candidate.resolve()
+            contained = resolved_candidate.parent == resolved_root
+        except OSError:
+            contained = False
+        if not contained:
+            raise EditaPlotError(
+                "managed_path_outside_engine_root",
+                "Refusing to traverse a managed path that resolves outside the engine root.",
+                path=str(candidate),
+                engine_home=str(resolved_root),
+            )
+    return candidate
+
+
+def _remove_managed_path(root: Path, path: Path) -> None:
+    path = _validated_managed_child(root, path)
+    if path.is_symlink() or path.is_file():
+        path.unlink(missing_ok=True)
+    elif path.is_dir():
+        shutil.rmtree(path)
+
+
+def _next_managed_path(root: Path, prefix: str) -> Path:
+    candidate = root / f"{prefix}{os.getpid()}"
+    suffix = 0
+    while candidate.exists() or candidate.is_symlink():
+        suffix += 1
+        candidate = root / f"{prefix}{os.getpid()}-{suffix}"
+    return _validated_managed_child(root, candidate)
+
+
+def _managed_recovery_paths(root: Path, prefix: str) -> list[Path]:
+    paths: list[Path] = []
+    for candidate in root.iterdir():
+        if candidate.name.startswith(prefix):
+            paths.append(_validated_managed_child(root, candidate))
+    return sorted(paths, key=lambda item: item.name)
+
+
+def _recover_managed_environment(root: Path, actions: list[dict[str, Any]]) -> None:
+    """Clean abandoned builds and restore the old env after an interrupted swap."""
+
+    env_root = _validated_managed_child(root, root / MANAGED_ENV_DIRECTORY)
+    for build in _managed_recovery_paths(root, MANAGED_ENV_BUILD_PREFIX):
+        _remove_managed_path(root, build)
+        actions.append({"action": "remove_abandoned_environment_build", "path": build.name})
+
+    stale_paths = _managed_recovery_paths(root, MANAGED_ENV_STALE_PREFIX)
+    if not (env_root.exists() or env_root.is_symlink()):
+        for stale in reversed(stale_paths):
+            os.replace(stale, env_root)
+            if managed_environment_status(root)["valid"]:
+                actions.append({"action": "restore_interrupted_environment_swap", "path": stale.name})
+                stale_paths.remove(stale)
+                break
+            os.replace(env_root, stale)
+
+    if managed_environment_status(root)["valid"]:
+        for stale in stale_paths:
+            _remove_managed_path(root, stale)
+            actions.append({"action": "remove_obsolete_stale_environment", "path": stale.name})
+
+
+def _verify_managed_dependencies(python: Path) -> dict[str, Any]:
+    expected = {
+        {"yaml": "PyYAML", "PIL": "pillow"}.get(module, module): spec.partition("==")[2]
+        for module, spec in RUNTIME_DEPENDENCIES
+    }
+    script = (
+        "import importlib.metadata as m,json;"
+        f"e=json.loads({json.dumps(json.dumps(expected))});"
+        "a={};"
+        'exec("for n,v in e.items():\\n try:a[n]=m.version(n)==v\\n except '
+        'm.PackageNotFoundError:a[n]=False");'
+        "print(json.dumps(a))"
+    )
+    try:
+        completed = subprocess.run(  # noqa: S603 - fixed managed interpreter and metadata-only probe
+            [str(python), "-I", "-c", script],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+            timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return {"ok": False, "reason": f"dependency_probe_{type(exc).__name__}"}
+    if completed.returncode != 0:
+        return {"ok": False, "reason": "dependency_probe_failed"}
+    try:
+        state = json.loads(completed.stdout.strip().splitlines()[-1])
+    except (IndexError, json.JSONDecodeError):
+        return {"ok": False, "reason": "dependency_probe_invalid"}
+    missing = sorted(name for name, available in state.items() if not available)
+    return {"ok": not missing, "missing_or_mismatched": missing}
+
+
+def repair_environment(*, engine_home: str | Path | None = None) -> dict[str, Any]:
+    """Create a project-local runtime and install only the audited Python dependencies.
+
+    This routine never installs, modifies, or launches Origin. Rendering tests
+    the existing local Origin Automation connection when the user requests a figure.
+    """
+
+    host = windows_host_compatibility()
+    if not host["compatible"]:
+        raise EditaPlotError(
+            "unsupported_windows_host",
+            "Automatic repair requires a physical Windows 10/11 x64 AMD64 host.",
+            host=host,
+        )
+    compatibility = python_compatibility()
+    if not compatibility["compatible"]:
+        raise EditaPlotError(
+            "python_version_unrepairable",
+            "Automatic repair requires 64-bit CPython 3.10, 3.11, or 3.12.",
+            compatibility=compatibility,
+        )
+    root = bootstrap_engine(engine_home)
+    with _exclusive_environment_lock(root):
+        return _repair_environment_transaction(root, compatibility)
+
+
+def _repair_environment_transaction(
+    root: Path,
+    compatibility: dict[str, Any],
+) -> dict[str, Any]:
+    """Build, verify, and activate the managed environment while holding its lock."""
+
+    env_root = root / MANAGED_ENV_DIRECTORY
+    python = _managed_python(root)
+    actions: list[dict[str, Any]] = []
+    constraints = Path(__file__).with_name("requirements-runtime.lock")
+    if not constraints.is_file():
+        raise EditaPlotError(
+            "dependency_lock_missing",
+            "The audited dependency lock is missing; refusing an unpinned repair.",
+        )
+
+    _recover_managed_environment(root, actions)
+    status = managed_environment_status(root)
+    if status["valid"]:
+        dependency_check = _verify_managed_dependencies(python)
+        if dependency_check["ok"]:
+            actions.append({"action": "reuse_verified_project_venv"})
+            return {
+                "schema_version": "1.0",
+                "ok": True,
+                "managed_environment": str(env_root),
+                "python_executable": str(python),
+                "actions": actions,
+                "installed_specs": [spec for _module, spec in RUNTIME_DEPENDENCIES],
+                "constraint_file": str(constraints),
+                "dependency_lock_sha256": _sha256(constraints),
+                "python_compatibility": compatibility,
+                "origin_installation_modified": False,
+                "next_step": "Run doctor again, then submit a data file.",
+            }
+
+    current_executable = os.path.normcase(str(Path(sys.executable).resolve()))
+    running_managed = python.is_file() and current_executable == os.path.normcase(str(python.resolve()))
+    if running_managed:
+        raise EditaPlotError(
+            "managed_environment_self_repair_requires_base_python",
+            "The active managed Python cannot safely replace itself. Rerun setup through "
+            "editaplot.cmd so a compatible base Python can perform the repair.",
+        )
+
+    build = _next_managed_path(root, MANAGED_ENV_BUILD_PREFIX)
+    build_python = _environment_python(build)
+    backup: Path | None = None
+    new_installed = False
+    try:
+        command = [sys.executable, "-m", "venv", str(build)]
+        try:
+            completed = subprocess.run(  # noqa: S603 - fixed interpreter/module invocation
+                command,
+                cwd=str(root),
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                check=False,
+                timeout=180,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise EditaPlotError(
+                "venv_creation_timeout",
+                "Creating the staged project-local environment exceeded 180 seconds.",
+            ) from exc
+        actions.append({"action": "create_staged_project_venv", "returncode": completed.returncode})
+        if completed.returncode != 0 or not build_python.is_file():
+            raise EditaPlotError(
+                "venv_creation_failed",
+                "Could not create the staged project-local EditaPlot environment.",
+                returncode=completed.returncode,
+            )
+
+        install_command = [
+            str(build_python),
+            "-m",
+            "pip",
+            "install",
+            "--disable-pip-version-check",
+            "--constraint",
+            str(constraints),
+            *[spec for _module, spec in RUNTIME_DEPENDENCIES],
+        ]
+        try:
+            completed = subprocess.run(  # noqa: S603 - fixed managed interpreter/package allowlist
+                install_command,
+                cwd=str(root),
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                check=False,
+                timeout=900,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise EditaPlotError(
+                "dependency_install_timeout",
+                "Installing the audited dependencies exceeded 900 seconds.",
+            ) from exc
+        actions.append({"action": "install_audited_runtime_dependencies", "returncode": completed.returncode})
+        if completed.returncode != 0:
+            raise EditaPlotError(
+                "dependency_install_failed",
+                "Could not install the audited Python dependencies in the staged environment.",
+                returncode=completed.returncode,
+                stderr_tail=completed.stderr[-1200:],
+            )
+        dependency_check = _verify_managed_dependencies(build_python)
+        if not dependency_check["ok"]:
+            raise EditaPlotError(
+                "dependency_verification_failed",
+                "The staged environment did not match the audited dependency set.",
+                **dependency_check,
+            )
+        probe = _probe_python_executable(build_python)
+        if not probe.get("ok") or not probe.get("compatible"):
+            raise EditaPlotError(
+                "managed_python_verification_failed",
+                "The staged project-local Python is not compatible.",
+                probe=probe,
+            )
+        fingerprint = {
+            "schema_version": "1.0",
+            "managed_by": "EditaPlot",
+            "base_python_executable": str(Path(sys.executable).resolve()),
+            "base_python_version": compatibility["version"],
+            "managed_python_version": probe["version"],
+            "architecture_bits": probe["architecture_bits"],
+            "dependency_lock_sha256": _sha256(constraints),
+            "dependency_policy_sha256": _dependency_policy_hash(),
+        }
+        fingerprint_path = build / MANAGED_ENV_FINGERPRINT
+        temporary_fingerprint = fingerprint_path.with_suffix(".tmp")
+        temporary_fingerprint.write_text(
+            json.dumps(fingerprint, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        os.replace(temporary_fingerprint, fingerprint_path)
+        actions.append({"action": "write_staged_environment_fingerprint"})
+
+        backup = _next_managed_path(root, MANAGED_ENV_STALE_PREFIX)
+        if env_root.exists() or env_root.is_symlink():
+            os.replace(env_root, backup)
+        os.replace(build, env_root)
+        new_installed = True
+        post_status = managed_environment_status(root)
+        post_dependencies = _verify_managed_dependencies(python)
+        if not post_status["valid"] or not post_dependencies["ok"]:
+            raise EditaPlotError(
+                "managed_environment_post_swap_verification_failed",
+                "The staged environment did not remain valid after the final swap.",
+                managed_status=post_status,
+                dependency_status=post_dependencies,
+            )
+        actions.append({"action": "activate_verified_project_venv"})
+    except BaseException:
+        backup_exists = backup is not None and (backup.exists() or backup.is_symlink())
+        build_was_activated = not (build.exists() or build.is_symlink()) and (
+            env_root.exists() or env_root.is_symlink()
+        )
+        if backup_exists and backup is not None:
+            if env_root.exists() or env_root.is_symlink():
+                _remove_managed_path(root, env_root)
+            os.replace(backup, env_root)
+        elif new_installed or build_was_activated:
+            _remove_managed_path(root, env_root)
+        if build.exists() or build.is_symlink():
+            _remove_managed_path(root, build)
+        raise
+
+    if backup is not None and (backup.exists() or backup.is_symlink()):
+        _remove_managed_path(root, backup)
+        actions.append({"action": "remove_stale_environment_after_success"})
+    _recover_managed_environment(root, actions)
+    return {
+        "schema_version": "1.0",
+        "ok": True,
+        "managed_environment": str(env_root),
+        "python_executable": str(python),
+        "actions": actions,
+        "installed_specs": [spec for _module, spec in RUNTIME_DEPENDENCIES],
+        "constraint_file": str(constraints),
+        "dependency_lock_sha256": _sha256(constraints),
+        "python_compatibility": compatibility,
+        "origin_installation_modified": False,
+        "next_step": "Run doctor again, then submit a data file.",
+    }
+
+
+def _origin_executable_from_command(command: str) -> Path | None:
+    expanded = os.path.expandvars(command.strip())
+    quoted = re.match(r'^\s*"([^"]+\.exe)"', expanded, flags=re.IGNORECASE)
+    unquoted = re.match(r"^\s*(.+?\.exe)(?:\s|$)", expanded, flags=re.IGNORECASE)
+    match = quoted or unquoted
+    if match is None:
+        return None
+    executable = Path(match.group(1).strip()).expanduser()
+    if executable.name.casefold() != "origin64.exe":
+        return None
+    try:
+        resolved = executable.resolve()
+    except OSError:
+        return None
+    return resolved if resolved.is_file() else None
+
+
+def _origin_registry_views(winreg: Any) -> tuple[tuple[int, str], ...]:
+    candidates = (
+        (0, "default registry view"),
+        (getattr(winreg, "KEY_WOW64_32KEY", 0), "32-bit registry view"),
+        (getattr(winreg, "KEY_WOW64_64KEY", 0), "64-bit registry view"),
+    )
+    views: list[tuple[int, str]] = []
+    seen: set[int] = set()
+    for flag, label in candidates:
+        if flag in seen:
+            continue
+        seen.add(flag)
+        views.append((flag, label))
+    return tuple(views)
+
+
+def _origin_registry_value(
+    winreg: Any,
+    hive: Any,
+    subkey: str,
+    view: int,
+    name: str | None = None,
+) -> str | None:
+    try:
+        with winreg.OpenKey(
+            hive,
+            subkey,
+            0,
+            winreg.KEY_READ | view,
+        ) as key:
+            value, _kind = winreg.QueryValueEx(key, name)
+    except (AttributeError, OSError):
+        return None
+    return str(value).strip() if value is not None and str(value).strip() else None
+
+
+def _empty_origin_registration(
+    progid: str,
+    role: str,
+    *,
+    reason: str = "origin_com_progid_not_registered",
+) -> dict[str, Any]:
+    return {
+        "role": role,
+        "progid": progid,
+        "registration_detected": False,
+        "path": None,
+        "clsid": None,
+        "registry_view": None,
+        "reason": reason,
+        "callability_status": "not_detected",
+    }
+
+
+def _discover_origin_com_registration(
+    winreg: Any,
+    *,
+    progid: str,
+    role: str,
+) -> dict[str, Any]:
+    result = _empty_origin_registration(progid, role)
+    views = _origin_registry_views(winreg)
+    clsids: list[tuple[str, int, str]] = []
+    seen_clsids: set[str] = set()
+    for view, label in views:
+        clsid = _origin_registry_value(
+            winreg,
+            winreg.HKEY_CLASSES_ROOT,
+            rf"{progid}\CLSID",
+            view,
+        )
+        if not clsid:
+            continue
+        if result["clsid"] is None:
+            result["clsid"] = clsid
+            result["registry_view"] = label
+        normalized = clsid.casefold()
+        if normalized in seen_clsids:
+            continue
+        seen_clsids.add(normalized)
+        clsids.append((clsid, view, label))
+
+    if not clsids:
+        return result
+
+    for clsid, progid_view, progid_label in clsids:
+        searches = [
+            (rf"CLSID\{clsid}\LocalServer32", progid_view, progid_label),
+            *[(rf"CLSID\{clsid}\LocalServer32", view, label) for view, label in views if view != progid_view],
+            (rf"WOW6432Node\CLSID\{clsid}\LocalServer32", 0, "WOW6432Node"),
+        ]
+        seen_searches: set[tuple[str, int]] = set()
+        for subkey, view, label in searches:
+            search_key = (subkey.casefold(), view)
+            if search_key in seen_searches:
+                continue
+            seen_searches.add(search_key)
+            command = _origin_registry_value(
+                winreg,
+                winreg.HKEY_CLASSES_ROOT,
+                subkey,
+                view,
+            )
+            if not command:
+                continue
+            executable = _origin_executable_from_command(command)
+            if executable is not None:
+                return {
+                    **result,
+                    "registration_detected": True,
+                    "path": str(executable),
+                    "clsid": clsid,
+                    "registry_view": label,
+                    "reason": "registered_origin64_executable_found",
+                    "callability_status": "registration_detected",
+                }
+    return {
+        **result,
+        "reason": "registered_origin64_executable_missing",
+    }
+
+
+def _origin_executable_from_install_record(
+    *,
+    display_icon: str | None,
+    install_location: str | None,
+) -> Path | None:
+    if display_icon:
+        executable = _origin_executable_from_command(display_icon)
+        if executable is not None:
+            return executable
+    if install_location:
+        location = Path(os.path.expandvars(install_location.strip().strip('"'))).expanduser()
+        command = f'"{location / "Origin64.exe"}"'
+        executable = _origin_executable_from_command(command)
+        if executable is not None:
+            return executable
+    return None
+
+
+def _same_origin_executable(first: str | Path, second: str | Path) -> bool:
+    try:
+        return os.path.samefile(first, second)
+    except OSError:
+        first_key = os.path.normcase(os.path.abspath(os.fspath(first)))
+        second_key = os.path.normcase(os.path.abspath(os.fspath(second)))
+        return first_key == second_key
+
+
+def _discover_installed_origin_candidates(winreg: Any) -> list[dict[str, Any]]:
+    query_info = getattr(winreg, "QueryInfoKey", None)
+    enum_key = getattr(winreg, "EnumKey", None)
+    if query_info is None or enum_key is None:
+        return []
+
+    uninstall_key = r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"
+    hives = [
+        ("HKLM", getattr(winreg, "HKEY_LOCAL_MACHINE", None)),
+        ("HKCU", getattr(winreg, "HKEY_CURRENT_USER", None)),
+    ]
+    candidates: list[dict[str, Any]] = []
+    for hive_label, hive in hives:
+        if hive is None:
+            continue
+        for view, view_label in _origin_registry_views(winreg):
+            try:
+                with winreg.OpenKey(
+                    hive,
+                    uninstall_key,
+                    0,
+                    winreg.KEY_READ | view,
+                ) as key:
+                    count = int(query_info(key)[0])
+                    subkeys = []
+                    for index in range(count):
+                        try:
+                            subkeys.append(str(enum_key(key, index)))
+                        except OSError:
+                            continue
+            except (AttributeError, OSError, TypeError, ValueError):
+                continue
+
+            for child in subkeys:
+                product_key = rf"{uninstall_key}\{child}"
+                display_name = _origin_registry_value(
+                    winreg,
+                    hive,
+                    product_key,
+                    view,
+                    "DisplayName",
+                )
+                if not display_name or not re.match(
+                    r"^Origin(?:Pro)?(?:\s+|(?=\d))",
+                    display_name,
+                    flags=re.IGNORECASE,
+                ):
+                    continue
+                display_version = _origin_registry_value(
+                    winreg,
+                    hive,
+                    product_key,
+                    view,
+                    "DisplayVersion",
+                )
+                display_icon = _origin_registry_value(
+                    winreg,
+                    hive,
+                    product_key,
+                    view,
+                    "DisplayIcon",
+                )
+                install_location = _origin_registry_value(
+                    winreg,
+                    hive,
+                    product_key,
+                    view,
+                    "InstallLocation",
+                )
+                executable = _origin_executable_from_install_record(
+                    display_icon=display_icon,
+                    install_location=install_location,
+                )
+                if executable is None:
+                    continue
+                existing = next(
+                    (item for item in candidates if _same_origin_executable(str(item["path"]), executable)),
+                    None,
+                )
+                if existing is not None:
+                    if not existing.get("display_version") and display_version:
+                        existing["display_version"] = display_version
+                    continue
+                candidates.append(
+                    {
+                        "display_name": display_name,
+                        "display_version": display_version,
+                        "path": str(executable),
+                        "registry_hive": hive_label,
+                        "registry_view": view_label,
+                        "active_registration": False,
+                        "active_registration_roles": [],
+                    }
+                )
+    return candidates
+
+
+def discover_origin_application() -> dict[str, Any]:
+    """Discover Origin Automation registrations without launching or modifying Origin."""
+
+    launch = _empty_origin_registration(
+        "Origin.Application",
+        "launch_isolated",
+    )
+    attach = _empty_origin_registration(
+        "Origin.ApplicationSI",
+        "attach_existing",
+    )
+    result: dict[str, Any] = {
+        "application_present": False,
+        "path": None,
+        "progid": launch["progid"],
+        "clsid": None,
+        "registry_view": None,
+        "callability_status": "not_detected",
+        "registration_detected": False,
+        "launch_registration_detected": False,
+        "attach_registration_detected": False,
+        "preferred_connection_mode": "launch_isolated",
+        "registrations": [launch, attach],
+        "multiple_installations_detected": False,
+        "installed_candidates": [],
+        "live_connection_tested": False,
+        "live_connection_status": "not_tested",
+    }
+    if platform.system() != "Windows":
+        return {**result, "reason": "windows_required"}
+    try:
+        import winreg
+    except ImportError:  # pragma: no cover - winreg exists on supported Windows CPython
+        return {**result, "reason": "winreg_unavailable"}
+
+    launch = _discover_origin_com_registration(
+        winreg,
+        progid="Origin.Application",
+        role="launch_isolated",
+    )
+    attach = _discover_origin_com_registration(
+        winreg,
+        progid="Origin.ApplicationSI",
+        role="attach_existing",
+    )
+    registrations = [launch, attach]
+    installed_candidates = _discover_installed_origin_candidates(winreg)
+    for candidate in installed_candidates:
+        roles = [
+            str(registration["role"])
+            for registration in registrations
+            if registration["registration_detected"]
+            and registration["path"]
+            and _same_origin_executable(str(registration["path"]), str(candidate["path"]))
+        ]
+        candidate["active_registration_roles"] = roles
+        candidate["active_registration"] = bool(roles)
+    installed_candidates.sort(
+        key=lambda item: (
+            not bool(item["active_registration"]),
+            str(item["display_name"]).casefold(),
+            str(item["path"]).casefold(),
+        )
+    )
+
+    launch_detected = bool(launch["registration_detected"])
+    attach_detected = bool(attach["registration_detected"])
+    any_detected = launch_detected or attach_detected
+    if launch_detected:
+        reason = "registered_origin64_executable_found"
+    elif attach_detected:
+        reason = "origin_isolated_registration_missing"
+    else:
+        reason = str(launch["reason"])
+    return {
+        **result,
+        "application_present": launch_detected,
+        "path": launch["path"],
+        "progid": launch["progid"],
+        "clsid": launch["clsid"],
+        "registry_view": launch["registry_view"],
+        "callability_status": ("registration_detected" if launch_detected else "not_detected"),
+        "reason": reason,
+        "registration_detected": any_detected,
+        "launch_registration_detected": launch_detected,
+        "attach_registration_detected": attach_detected,
+        "registrations": registrations,
+        "multiple_installations_detected": len(installed_candidates) > 1,
+        "installed_candidates": installed_candidates,
+    }
+
+
+def _public_origin_execution_context() -> dict[str, object]:
+    """Return the redacted worker identity classification when available."""
+
+    try:
+        from origin_sciplot.origin_backend.execution_context import (
+            public_origin_execution_context,
+        )
+    except (ImportError, ModuleNotFoundError):
+        return {
+            "status": "unknown",
+            "requires_current_user_approval": False,
+        }
+    payload = public_origin_execution_context()
+    status = str(payload.get("status", "unknown"))
+    if status not in {"interactive_user", "codex_sandbox", "non_windows", "unknown"}:
+        status = "unknown"
+    return {
+        "status": status,
+        "requires_current_user_approval": status == "codex_sandbox",
+    }
+
+
+def doctor(*, engine_home: str | Path | None = None) -> dict[str, Any]:
+    checks: list[dict[str, Any]] = []
+    host = windows_host_compatibility()
+    compatibility = python_compatibility()
+    python_reason_codes = {
+        "cpython_required",
+        "64_bit_python_required",
+        "python_too_old",
+        "python_not_yet_verified",
+    }
+    python_ok = not any(reason in python_reason_codes for reason in compatibility["reasons"])
+    checks.append(
+        {
+            "name": "python_version",
+            "ok": python_ok,
+            "value": platform.python_version(),
+            "required": compatibility["required"],
+            "implementation": compatibility["implementation"],
+            "architecture_bits": compatibility["architecture_bits"],
+            "reasons": compatibility["reasons"],
+        }
+    )
+    windows = bool(host["compatible"])
+    checks.append(
+        {
+            "name": "supported_windows_host",
+            "ok": windows,
+            "value": platform.platform(),
+            "machine": host["machine"],
+            "windows_major": host["windows_major"],
+            "required": host["required"],
+            "reasons": host["reasons"],
+        }
+    )
+    origin_application = discover_origin_application()
+    launch_registration_detected = bool(
+        origin_application.get(
+            "launch_registration_detected",
+            origin_application.get("application_present", False),
+        )
+    )
+    attach_registration_detected = bool(origin_application.get("attach_registration_detected", False))
+    checks.append(
+        {
+            "name": "origin_application",
+            "ok": launch_registration_detected,
+            "value": origin_application["path"],
+            "required": "local Origin64.exe registered as Origin.Application",
+            "callability_status": origin_application["callability_status"],
+            "registration_detected": bool(
+                origin_application.get(
+                    "registration_detected",
+                    origin_application.get("application_present", False),
+                )
+            ),
+            "launch_registration_detected": launch_registration_detected,
+            "attach_registration_detected": attach_registration_detected,
+            "live_connection_tested": bool(origin_application.get("live_connection_tested", False)),
+        }
+    )
+    try:
+        root = bootstrap_engine(engine_home)
+        engine_ok = True
+        checks.append({"name": "engine", "ok": True, "value": str(root)})
+    except EditaPlotError as exc:
+        root = None
+        engine_ok = False
+        checks.append({"name": "engine", "ok": False, "value": str(exc)})
+
+    execution_context = _public_origin_execution_context()
+    has_interactive_origin_context = (
+        execution_context["status"] == "interactive_user"
+    )
+    requires_current_user_approval = bool(
+        execution_context["requires_current_user_approval"]
+    )
+    checks.append(
+        {
+            "name": "origin_execution_context",
+            "ok": has_interactive_origin_context,
+            "value": execution_context["status"],
+            "requires_current_user_approval": requires_current_user_approval,
+        }
+    )
+
+    dependencies = tuple(module for module, _spec in RUNTIME_DEPENDENCIES)
+    expected_versions = {module: spec.partition("==")[2] for module, spec in RUNTIME_DEPENDENCIES}
+    dependency_state: dict[str, bool] = {}
+    for name in dependencies:
+        available = importlib.util.find_spec(name) is not None
+        version = None
+        if available and importlib_metadata is not None:
+            package_name = {"yaml": "PyYAML", "PIL": "pillow"}.get(name, name)
+            try:
+                version = importlib_metadata.version(package_name)
+            except importlib_metadata.PackageNotFoundError:
+                version = "unknown"
+        dependency_state[name] = bool(available and version == expected_versions[name])
+        checks.append(
+            {
+                "name": f"python_dependency:{name}",
+                "ok": dependency_state[name],
+                "value": version,
+                "required": expected_versions[name],
+            }
+        )
+
+    ready_analysis = (
+        python_ok
+        and windows
+        and engine_ok
+        and all(dependency_state[name] for name in dependencies if name not in {"originpro", "OriginExt"})
+    )
+    ready_render = (
+        ready_analysis
+        and dependency_state["originpro"]
+        and dependency_state["OriginExt"]
+        and launch_registration_detected
+    )
+    missing_dependencies = [name for name in dependencies if not dependency_state[name]]
+    checks.append(
+        {
+            "name": "automatic_repair_python",
+            "ok": python_ok,
+            "value": platform.python_version(),
+            "required": compatibility["required"],
+        }
+    )
+    repairable = bool(python_ok and windows and engine_ok and missing_dependencies)
+    manual_blockers: list[str] = []
+    if not python_ok:
+        manual_blockers.append("install_64_bit_cpython_3_10_to_3_12")
+    if not windows:
+        manual_blockers.extend(host["reasons"] or ["use_supported_windows_host"])
+    if not engine_ok:
+        manual_blockers.append("provide_editaplot_engine_home")
+    if windows and not launch_registration_detected:
+        if attach_registration_detected:
+            manual_blockers.append("origin_isolated_registration_missing")
+        else:
+            manual_blockers.append("origin_automation_application_not_detected")
+    if missing_dependencies and not python_ok:
+        manual_blockers.append("automatic_repair_requires_verified_python")
+    if not dependency_state.get("originpro", False):
+        manual_blockers.append("python_originpro_package_missing")
+    if not dependency_state.get("OriginExt", False):
+        manual_blockers.append("python_originext_package_missing")
+    if ready_render and requires_current_user_approval:
+        summary_zh = (
+            "环境已具备绘图前提；当前 Doctor 在 Codex 沙箱中运行，"
+            "真正启动 Origin 时需要一次当前用户权限审批。"
+        )
+        next_step_zh = (
+            "请允许 Codex 为 origin-smoke 或 render 发起的本地 Origin 权限申请；"
+            "只有申请获批后 Codex 才会重新执行同一条 Origin 命令；审批不保证通过。"
+        )
+    elif ready_render and execution_context["status"] == "unknown":
+        summary_zh = (
+            "环境已具备绘图前提，但当前 Doctor 无法确认用于 Origin 的 Windows 执行身份；"
+            "正式绘图会在调用 Automation 前停止。"
+        )
+        next_step_zh = (
+            "请从正常登录的 Windows 用户上下文重新运行 Doctor；若仍显示 unknown，"
+            "请停止自动绘图并报告 origin_execution_context_unknown。"
+        )
+    elif ready_render:
+        summary_zh = "环境已具备绘图前提；真正的 Origin 连接会在绘图或独立 smoke test 时完成。"
+        next_step_zh = "直接提交数据即可，EditaPlot 会自动启动一个专用 Origin 实例。"
+    elif ready_analysis:
+        summary_zh = "数据分析环境可用，但 Origin 绘图前提尚未全部满足。"
+        next_step_zh = (
+            "可自动修复 Python 依赖。"
+            if repairable
+            else "请根据 manual_blockers 修复技术环境后重新运行 Doctor。"
+        )
+    else:
+        summary_zh = "当前环境尚未达到 EditaPlot 的基础运行要求。"
+        next_step_zh = "请先处理 manual_blockers 中的基础环境问题。"
+    return {
+        "schema_version": "1.0",
+        "ok": ready_analysis,
+        "summary_zh": summary_zh,
+        "next_step_zh": next_step_zh,
+        "ready_for_analysis": ready_analysis,
+        "ready_for_render": ready_render,
+        "current_process_has_interactive_origin_context": has_interactive_origin_context,
+        "requires_current_user_approval": requires_current_user_approval,
+        "origin_execution_context": execution_context,
+        "origin_application": origin_application,
+        "origin_callability_check": "performed_during_render",
+        "missing_python_dependencies": missing_dependencies,
+        "automatic_repair": {
+            "available": repairable,
+            "scope": "project_local_python_dependencies_only",
+            "managed_environment": str((root / MANAGED_ENV_DIRECTORY) if root else MANAGED_ENV_DIRECTORY),
+            "managed_environment_status": managed_environment_status(root) if root else None,
+            "supported_python": compatibility["required"],
+            "origin_installation_modified": False,
+        },
+        "manual_blockers": manual_blockers,
+        "checks": checks,
+    }
+
+
+def catalog(*, engine_home: str | Path | None = None) -> dict[str, Any]:
+    root = bootstrap_engine(engine_home)
+    try:
+        from origin_sciplot.origin_backend.template_capabilities import (
+            get_template_capability_profile,
+        )
+        from origin_sciplot.template_registry import TemplateRegistry
+    except Exception as exc:  # noqa: BLE001
+        raise EditaPlotError("engine_import_failed", f"Could not import template registry: {exc}") from exc
+    templates = []
+    for manifest in TemplateRegistry().implemented():
+        capability_profile = get_template_capability_profile(manifest.id)
+        templates.append(
+            {
+                "id": manifest.id,
+                "name": manifest.name,
+                "family": manifest.family,
+                "support_level": "verified" if manifest.id in VERIFIED_TEMPLATE_IDS else "experimental",
+                "description": manifest.description,
+                "required_columns": list(manifest.data_guide.required_columns),
+                "optional_columns": list(manifest.data_guide.optional_columns),
+                "accepted_layouts": list(manifest.data_guide.accepted_layouts),
+                "origin_capabilities": capability_profile.to_dict(),
+                "examples": [
+                    {"id": item.id, "name": item.name, "description": item.description}
+                    for item in manifest.examples
+                ],
+            }
+        )
+    return {"schema_version": "1.0", "ok": True, "engine_home": str(root), "templates": templates}
+
+
+def palette_catalog(
+    *,
+    engine_home: str | Path | None = None,
+    public_only: bool = True,
+) -> dict[str, Any]:
+    root = bootstrap_engine(engine_home)
+    try:
+        from origin_sciplot.palette_catalog import list_palettes, palette_to_dict
+    except Exception as exc:  # noqa: BLE001
+        raise EditaPlotError("engine_import_failed", f"Could not import palette catalog: {exc}") from exc
+    palettes = [palette_to_dict(item) for item in list_palettes(public_only=public_only)]
+    return {
+        "schema_version": "1.0",
+        "ok": True,
+        "engine_home": str(root),
+        "public_only": public_only,
+        "palette_count": len(palettes),
+        "palettes": palettes,
+    }
+
+
+def _font_readback_audit(report: dict[str, Any]) -> dict[str, Any]:
+    expected_codes: list[int] = []
+    actual_codes: dict[str, int] = {}
+
+    def walk(value: Any, path: str = "") -> None:
+        if isinstance(value, dict):
+            for key, item in value.items():
+                child = f"{path}.{key}" if path else str(key)
+                canonical = str(key).casefold()
+                if canonical == "font_code_expected" and isinstance(item, (int, float)):
+                    expected_codes.append(int(round(float(item))))
+                elif isinstance(item, (int, float)) and (
+                    canonical in {"font", "font_code"}
+                    or canonical.endswith(".font")
+                    or canonical.endswith(".font_code")
+                    or canonical.endswith("_font")
+                    or canonical.endswith("_font_code")
+                ):
+                    actual_codes[child] = int(round(float(item)))
+                walk(item, child)
+        elif isinstance(value, list):
+            for index, item in enumerate(value):
+                walk(item, f"{path}[{index}]")
+
+    walk(
+        {
+            "origin_axis_state": report.get("origin_axis_state"),
+            "origin_text_state": report.get("origin_text_state"),
+        }
+    )
+    unique_expected = sorted(set(expected_codes))
+    mismatches = {
+        path: code
+        for path, code in actual_codes.items()
+        if len(unique_expected) != 1 or code != unique_expected[0]
+    }
+    return {
+        "ok": bool(actual_codes) and len(unique_expected) == 1 and not mismatches,
+        "expected_font_codes": unique_expected,
+        "actual_font_codes": actual_codes,
+        "mismatches": mismatches,
+    }
+
+
+def verify_output(path: str | Path) -> dict[str, Any]:
+    output = Path(path).resolve()
+    if not output.is_dir():
+        raise EditaPlotError("output_not_found", "The Origin output directory does not exist.")
+    expected = {
+        "opju": output / "result.opju",
+        "png": output / "result.png",
+        "pdf": output / "result.pdf",
+        "tif": output / "result.tif",
+        "origin_verify_report": output / "origin_verify_report.json",
+        "validation_report": output / "validation_report.json",
+    }
+    artifacts: dict[str, Any] = {}
+    all_nonempty = True
+    for name, file in expected.items():
+        exists = file.is_file()
+        size = file.stat().st_size if exists else 0
+        ok = exists and size > 0
+        all_nonempty = all_nonempty and ok
+        artifacts[name] = {"path": str(file), "exists": exists, "size_bytes": size, "ok": ok}
+
+    readback_valid = False
+    readback_keys: list[str] = []
+    semantic_checks: dict[str, Any] = {
+        "axis_state_present": False,
+        "text_state_present": False,
+        "exports_confirmed": False,
+        "source_data_not_modified": False,
+        "font_readback": {"ok": False},
+    }
+    report_path = expected["origin_verify_report"]
+    if report_path.is_file() and report_path.stat().st_size:
+        try:
+            report = json.loads(report_path.read_text(encoding="utf-8"))
+            readback_valid = isinstance(report, dict) and bool(report)
+            readback_keys = sorted(str(key) for key in report) if isinstance(report, dict) else []
+            if isinstance(report, dict):
+                exports = report.get("exports")
+                semantic_checks = {
+                    "axis_state_present": isinstance(report.get("origin_axis_state"), dict)
+                    and bool(report.get("origin_axis_state")),
+                    "text_state_present": isinstance(report.get("origin_text_state"), dict)
+                    and bool(report.get("origin_text_state")),
+                    "exports_confirmed": isinstance(exports, dict)
+                    and all(bool(exports.get(name)) for name in ("png", "pdf", "tif")),
+                    "source_data_not_modified": report.get("source_data_modified") is False,
+                    "font_readback": _font_readback_audit(report),
+                }
+        except (OSError, json.JSONDecodeError):
+            readback_valid = False
+
+    semantic_pass = (
+        semantic_checks["axis_state_present"]
+        and semantic_checks["text_state_present"]
+        and semantic_checks["exports_confirmed"]
+        and semantic_checks["source_data_not_modified"]
+        and bool(semantic_checks["font_readback"].get("ok"))
+    )
+    programmatic_pass = all_nonempty and readback_valid and semantic_pass
+    return {
+        "schema_version": "1.0",
+        "ok": programmatic_pass,
+        "output_directory": str(output),
+        "programmatic_pass": programmatic_pass,
+        "origin_readback_valid": readback_valid,
+        "origin_readback_top_level_keys": readback_keys,
+        "semantic_checks": semantic_checks,
+        "artifacts": artifacts,
+        "human_visual_qa": {
+            "status": "pending",
+            "required_checks": [
+                "axis direction and ticks",
+                "title and label clipping",
+                "font and line-weight readability",
+                "color semantics",
+                "unexpected Origin objects",
+                "scientific transform matches contract",
+            ],
+        },
+    }
+
+
+def write_json(path: str | Path, payload: dict[str, Any]) -> Path:
+    target = Path(path).resolve()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = target.with_name(target.name + ".tmp")
+    temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    temporary.replace(target)
+    return target
+
+
+def load_json(path: str | Path) -> dict[str, Any]:
+    try:
+        payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise EditaPlotError("json_read_failed", f"Could not read JSON: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise EditaPlotError("json_object_required", "Expected a JSON object.")
+    return payload
+
+
+def summarize_paths(items: Iterable[Path]) -> list[str]:
+    return [str(item.resolve()) for item in items]
+
+
+__all__ = [
+    "EditaPlotError",
+    "bootstrap_engine",
+    "build_plan",
+    "build_medical_panel_plan",
+    "build_origin_smoke_command",
+    "build_worker_command",
+    "catalog",
+    "doctor",
+    "inspect_data",
+    "load_json",
+    "recommend_charts",
+    "resolve_engine_home",
+    "validate_plan",
+    "verify_output",
+    "write_json",
+]
