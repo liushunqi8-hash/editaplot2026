@@ -11,16 +11,20 @@
     <img alt="Fully verified with Origin 2024b" src="https://img.shields.io/badge/fully%20verified-2024b-0f766e">
     <a href="https://github.com/liushunqi8-hash/editaplot2026"><img alt="GitHub Stars" src="https://img.shields.io/github/stars/liushunqi8-hash/editaplot2026?style=social"></a>
   </p>
-  <p><a href="README.en.md">English</a> · <strong>中文</strong>（双语简介见下方，详细文档仍以中文为主）</p>
+  <p><a href="README.en.md">English</a> · <a href="README.zh-TW.md">繁體中文</a> · <strong>简体中文</strong>（双语简介见下方，完整版本见对应语言文件）</p>
 </div>
 
 EditaPlot 是一个面向 Codex 的 Windows 本地科研绘图 Skill。你把自己的实验数据交给它后，它会依次理解数据、逐列说明用途、推荐图形、请你确认图形元素、调用 Origin 并验证结果，最后生成**可编辑 OPJU**，同时导出 PNG、PDF、TIF。
 
 EditaPlot is a Codex skill for editable scientific plotting on Windows. You hand it your experimental data; it reads the table, proposes chart types, asks you to confirm each column's role and the figure elements, drives a dedicated Origin instance, and finally produces an **editable OPJU** together with PNG, PDF, and TIF exports.
 
+EditaPlot 是一個導向 Codex 的 Windows 本機科學繪圖 Skill。你把實驗資料交給它後，它會依序理解資料、逐欄說明用途、推薦圖形、請你確認圖形元素、呼叫 Origin 並驗證結果，最後產出**可編輯 OPJU**，同時匯出 PNG、PDF、TIF。
+
 我不希望它只是一套"替换数字"的静态模板，也不会让 Python 预览图冒充 Origin 成图。科学含义和最终选择始终由你决定；遇到把握不足的数据，EditaPlot 会把不确定的列单独列出来请你确认，不会擅自补列、拟合或推断结论。
 
 It is not a static "replace-the-numbers" template, and it never passes a Python preview off as the real Origin figure. Scientific meaning and the final choice stay with you; ambiguous columns are surfaced for your confirmation rather than silently filled in, fitted, or reinterpreted.
+
+它不只是一套「替換數字」的靜態範本，也不會讓 Python 預覽圖冒充 Origin 成品圖。科學意義與最終選擇始終由你決定；遇到不確定的資料，EditaPlot 會把有疑慮的欄位單獨列出請你確認，不會擅自補欄、擬合或推論結論。
 
 > [!WARNING]
 > **中文：** 目前只完成了 Windows 10/11 x64 实体电脑上的完整验证。暂未提供 macOS（Intel 与 Apple Silicon）、Linux、WSL、Wine/CrossOver、Parallels 或其他虚拟机版本。如果你使用 Mac，请换用 Windows 实体电脑完成 Origin 全流程。
