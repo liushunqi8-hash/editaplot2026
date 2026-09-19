@@ -9,20 +9,28 @@
     <img alt="Codex Skill" src="https://img.shields.io/badge/Codex-Skill-7c3aed">
     <img alt="Origin 2021–2026b compatibility target" src="https://img.shields.io/badge/Origin-2021%E2%80%932026b%20target-2563eb">
     <img alt="Fully verified with Origin 2024b" src="https://img.shields.io/badge/fully%20verified-2024b-0f766e">
-    <a href="https://github.com/hang-jin/editaplot"><img alt="GitHub Stars" src="https://img.shields.io/github/stars/hang-jin/editaplot?style=social"></a>
+    <a href="https://github.com/liushunqi8-hash/editaplot2026"><img alt="GitHub Stars" src="https://img.shields.io/github/stars/liushunqi8-hash/editaplot2026?style=social"></a>
   </p>
-  <p><a href="README.en.md">English</a> · 中文为主要说明语言</p>
+  <p><a href="README.en.md">English</a> · <strong>中文</strong>（双语简介见下方，详细文档仍以中文为主）</p>
 </div>
 
-我把 EditaPlot 做成了一个面向 Codex 的 Windows 本地科研绘图 Skill。你把自己的实验数据交给它后，它会依次理解数据、逐列说明用途、推荐图形、请你确认图形元素、调用 Origin 并验证结果，最后生成**可编辑 OPJU**，同时导出 PNG、PDF、TIF。
+EditaPlot 是一个面向 Codex 的 Windows 本地科研绘图 Skill。你把自己的实验数据交给它后，它会依次理解数据、逐列说明用途、推荐图形、请你确认图形元素、调用 Origin 并验证结果，最后生成**可编辑 OPJU**，同时导出 PNG、PDF、TIF。
 
-我不希望它只是一套“替换数字”的静态模板，也不会让 Python 预览图冒充 Origin 成图。科学含义和最终选择始终由你决定；遇到把握不足的数据，EditaPlot 会把不确定的列单独列出来请你确认，不会擅自补列、拟合或推断结论。
+EditaPlot is a Codex skill for editable scientific plotting on Windows. You hand it your experimental data; it reads the table, proposes chart types, asks you to confirm each column's role and the figure elements, drives a dedicated Origin instance, and finally produces an **editable OPJU** together with PNG, PDF, and TIF exports.
+
+我不希望它只是一套"替换数字"的静态模板，也不会让 Python 预览图冒充 Origin 成图。科学含义和最终选择始终由你决定；遇到把握不足的数据，EditaPlot 会把不确定的列单独列出来请你确认，不会擅自补列、拟合或推断结论。
+
+It is not a static "replace-the-numbers" template, and it never passes a Python preview off as the real Origin figure. Scientific meaning and the final choice stay with you; ambiguous columns are surfaced for your confirmation rather than silently filled in, fitted, or reinterpreted.
 
 > [!WARNING]
-> **我目前只完成了 Windows 10/11 x64 实体电脑上的完整验证。** 因此 V1 暂未提供 macOS（Intel 与 Apple Silicon）、Linux、WSL、Wine/CrossOver、Parallels 或其他虚拟机版本。如果你使用 Mac，这一版暂时还不能完成 Origin 全流程；当前请换用 Windows 实体电脑，后续支持情况以 release 说明为准。
+> **中文：** 目前只完成了 Windows 10/11 x64 实体电脑上的完整验证。暂未提供 macOS（Intel 与 Apple Silicon）、Linux、WSL、Wine/CrossOver、Parallels 或其他虚拟机版本。如果你使用 Mac，请换用 Windows 实体电脑完成 Origin 全流程。
+>
+> **English:** Fully verified only on a physical Windows 10/11 x64 machine. macOS (Intel and Apple Silicon), Linux, WSL, Wine/CrossOver, Parallels, and other virtual machines are not supported yet. If you are on a Mac, please use a physical Windows host for the full Origin pipeline.
 
 > [!IMPORTANT]
-> 我已按 [Apache License 2.0](LICENSE) 开源 EditaPlot。当前兼容目标是 Origin/OriginPro 2021–2026b；你不必提前打开它，EditaPlot 会在绘图前自动启动一个专用实例。我不会替你安装或修改 Origin。
+> **中文：** 按 [Apache License 2.0](LICENSE) 开源。当前兼容目标为 Origin/OriginPro 2021–2026b（v0.1.1 已在 Origin 2026 / 10.30 上实测通过）。你不必提前打开 Origin，EditaPlot 会在绘图前自动启动一个专用实例；它不会替你安装或修改 Origin。
+>
+> **English:** Released under [Apache License 2.0](LICENSE). Targets Origin/OriginPro 2021–2026b (v0.1.1 has been verified on Origin 2026 / 10.30). You do not need to open Origin beforehand — EditaPlot launches a dedicated instance itself and never installs or modifies Origin for you.
 
 ## 一眼看懂
 
@@ -88,7 +96,7 @@ XPS 想精确改样式时，我建议你直接这样说：“Raw 用 `#173F5F`�
 这是我从开源首日开始记录的 GitHub Star 总数。首个快照是一个真实的 31 Stars 起点；后续每日快照会自然连成折线。
 
 <div align="center">
-  <a href="https://github.com/hang-jin/editaplot"><img src="https://raw.githubusercontent.com/hang-jin/editaplot/metrics/assets/star-trend/stars.svg" width="760" alt="EditaPlot GitHub Star 趋势"></a>
+  <a href="https://github.com/liushunqi8-hash/editaplot2026"><img src="https://raw.githubusercontent.com/liushunqi8-hash/editaplot2026/metrics/assets/star-trend/stars.svg" width="760" alt="EditaPlot GitHub Star 趋势"></a>
 </div>
 
 我只保存“日期 + 仓库 Star 总数”，不读取或保存用户名、账号 ID、个人加星时间或名单。
@@ -248,7 +256,7 @@ EditaPlot 自带的 Python runtime 与 Origin 自动化不会主动把你的数�
 ### 2. 安装 Codex Skill
 
 ```powershell
-git clone https://github.com/hang-jin/editaplot.git
+git clone https://github.com/liushunqi8-hash/editaplot2026.git
 Set-Location editaplot
 .\editaplot.cmd setup
 ```
