@@ -3,7 +3,7 @@
 ## 30 秒版本
 
 前提：Windows 10/11 x64 实体电脑、64 位 CPython 3.10–3.12，以及本机已安装
-Origin/OriginPro 2021–2026b 范围内的版本。Origin 2024b（10.15）是当前唯一完整实机基线；
+Origin/OriginPro 2026（10.30）。本 fork 唯一实机验证的就是 Origin 2026 / 10.30；
 其他目标版本会经过本机握手、真实 smoke 和模板能力检查后报告兼容状态。Origin 2020b 及更早版本、
 macOS、Linux、WSL、Wine/CrossOver、Parallels 与其他虚拟机不支持。
 

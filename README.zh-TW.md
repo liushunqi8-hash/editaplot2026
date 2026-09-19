@@ -7,8 +7,8 @@
     <img alt="Platform: Windows 10/11 x64 only" src="https://img.shields.io/badge/platform-Windows%2010%2F11%20x64%20only-0078d4">
     <img alt="Python 3.10–3.12" src="https://img.shields.io/badge/Python-3.10%E2%80%933.12-3776ab">
     <img alt="Codex Skill" src="https://img.shields.io/badge/Codex-Skill-7c3aed">
-    <img alt="Origin 2021–2026b compatibility target" src="https://img.shields.io/badge/Origin-2021%E2%80%932026b%20target-2563eb">
-    <img alt="Fully verified with Origin 2024b" src="https://img.shields.io/badge/fully%20verified-2024b-0f766e">
+    <img alt="Origin 2026 (10.30) verified" src="https://img.shields.io/badge/Origin-2026%20(10.30)%20verified-2563eb">
+    <img alt="Fully verified with Origin 2026" src="https://img.shields.io/badge/fully%20verified-2026-0f766e">
     <a href="https://github.com/liushunqi8-hash/editaplot2026"><img alt="GitHub Stars" src="https://img.shields.io/github/stars/liushunqi8-hash/editaplot2026?style=social"></a>
   </p>
   <p><a href="README.en.md">English</a> · <a href="README.zh-TW.md">繁體中文</a> · <strong>簡體中文</strong>（雙語簡介見下方，完整版本見對應語言檔案）</p>
@@ -32,9 +32,9 @@ It is not a static "replace-the-numbers" template, and it never passes a Python 
 > **English:** Fully verified only on a physical Windows 10/11 x64 machine. macOS (Intel and Apple Silicon), Linux, WSL, Wine/CrossOver, Parallels, and other virtual machines are not supported yet. If you are on a Mac, please use a physical Windows host for the full Origin pipeline.
 
 > [!IMPORTANT]
-> **中文：** 按 [Apache License 2.0](LICENSE) 開源。當前相容目標為 Origin/OriginPro 2021–2026b（v0.1.1 已在 Origin 2026 / 10.30 上實測透過）。你不必提前開啟 Origin，EditaPlot 會在繪圖前自動啟動一個專用例項；它不會替你安裝或修改 Origin。
+> **中文：** 按 [Apache License 2.0](LICENSE) 開源。本 fork 唯一針對並實測於 Origin/OriginPro 2026 / 10.30。你不必提前開啟 Origin，EditaPlot 會在繪圖前自動啟動一個專用例項；它不會替你安裝或修改 Origin。
 >
-> **English:** Released under [Apache License 2.0](LICENSE). Targets Origin/OriginPro 2021–2026b (v0.1.1 has been verified on Origin 2026 / 10.30). You do not need to open Origin beforehand — EditaPlot launches a dedicated instance itself and never installs or modifies Origin for you.
+> **English:** Released under [Apache License 2.0](LICENSE). This fork targets and has been verified only on Origin/OriginPro 2026 (10.30). You do not need to open Origin beforehand — EditaPlot launches a dedicated instance itself and never installs or modifies Origin for you.
 
 ## 一眼看懂
 
@@ -225,7 +225,7 @@ Origin 自動化階段，其餘任務自動等待。等待事件名為 `origin_j
 | 專案 | 你需要知道的事 |
 |---|---|
 | 系統 | 我目前完整驗證的是 Windows 10/11 x64 實體電腦；Mac、Linux、WSL 與虛擬機器版本暫未提供 |
-| Origin | 相容目標為 Origin/OriginPro 2021–2026b；2024b（10.15）是當前唯一完整實機基線，其他目標版本會按本機握手、真實測試和模板能力報告 |
+| Origin | 本 fork 唯一針對並實機驗證於 Origin/OriginPro 2026 / 10.30；其他版本不在本 fork 支援範圍 |
 | Python | 需要 64 位 Python 3.10–3.12；啟動器會自動選擇，你無需手動配置 |
 | 資料 | 你可以使用 CSV、TXT、XLS 或 XLSX，也可以保留中文列名與中文路徑 |
 
@@ -364,7 +364,7 @@ $smokeDir = Join-Path $env:TEMP ("EditaPlot-origin-smoke-" + (Get-Date -Format "
 
 - 許可證：[Apache License 2.0](LICENSE)
 - 安裝與故障處理：[安裝指南](docs/installation.md)
-- Origin 版本邊界：[2021–2026b 相容說明](docs/origin-2021-2026-compatibility.md)
+- Origin 版本邊界：[2026 相容說明](docs/origin-2026-compatibility.md)
 - 中文快速開始：[docs/quickstart.zh-CN.md](docs/quickstart.zh-CN.md)
 - 貢獻說明：[CONTRIBUTING.md](CONTRIBUTING.md)
 - 安全報告：[SECURITY.md](SECURITY.md)

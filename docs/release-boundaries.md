@@ -80,13 +80,13 @@ OPJU/PDF/TIF 若以后作为 Release 附件公开，必须另行确认再分发�
   `<source_stem>_EditaPlot_<timestamp>` 同级文件夹。只有用户明确要求时才能改用其他位置。
 
 OriginLab 的 [External Python 文档](https://docs.originlab.com/externalpython/)说明了本机 Windows、
-Origin 版本和 Automation 的技术要求。EditaPlot 当前以 Origin/OriginPro 2021–2026b 为兼容
+Origin 版本和 Automation 的技术要求。EditaPlot 本 fork 唯一针对 Origin/OriginPro 2026 / 10.30；兼容
 目标，2020b 及更早版本不在当前外部路线支持范围；端到端完整验证基线仍是 2024b（10.15），
 也是目前唯一可称为完整实机基线的版本。其他目标版本先按本机握手、真实 smoke 和模板能力报告，
 只有生成完整可编辑产物、对象反读和视觉 QA 后才标记为已验证。
 
 不得把“检测到安装”“可以启动”或“Automation 握手成功”单独写成版本兼容成功。对
-2021–2026b 中尚未完成全量实机验收的版本，结果应写成检测到的版本、已通过的阶段、当前模板
+其他版本（本 fork 未验证），结果应写成检测到的版本、已通过的阶段、当前模板
 能力和下一步，而不是笼统承诺全部模板可用。
 
 当前项目采用中性品牌，只做本机互操作，不分发第三方应用，也不提供远程或云端 Automation 服务。若以后改为代算、托管、多租户或远程 Automation Server，必须重新审计技术架构、安全、隐私和第三方分发边界。

@@ -12,13 +12,13 @@ Linux、WSL、Wine/CrossOver、Parallels 及其他虚拟机均不支持。当前
 你还需要：
 
 - 64 位 CPython 3.10、3.11 或 3.12；CLI/依赖覆盖这三个版本，真实 Origin 端到端基线为 CPython 3.10；
-- 本机已安装兼容目标范围内的 Origin/OriginPro 2021–2026b；2024b / 10.15 是当前唯一
+- 本机已安装 Origin/OriginPro 2026 / 10.30（本 fork 唯一验证版本）
   完整实机基线，其他目标版本会按本机握手、真实 smoke 和模板能力报告兼容状态；
 - 完整的 EditaPlot 仓库，而不只是 `skill/editaplot` 子目录。
 
 Origin 2020b 及更早版本不在当前外部 `originpro` 路线的支持范围内。
 各版本怎样从“目标范围”进入“当前模板可用”状态，见
-[Origin 2021–2026b 兼容说明](origin-2021-2026-compatibility.md)。
+[Origin 2026 兼容说明](origin-2026-compatibility.md)。
 
 > `editaplot.cmd` 会优先使用电脑上已有的兼容 Python。Python 依赖只进入项目目录的
 > `.editaplot-venv`。完全没有兼容 Python 时，我会要求 Codex 先说明并取得你的明确确认，才可安装官方
@@ -342,7 +342,7 @@ V1 不支持。为避免“分析能跑、Origin 绘图不能跑”的半成品�
 EditaPlot V1 supports **physical Windows 10/11 x64 computers only**. macOS (Intel or Apple
 Silicon), Linux, WSL, Wine/CrossOver, Parallels, and other VMs are unsupported. Use 64-bit
 CPython 3.10–3.12 and a local Origin/OriginPro application reachable through Automation.
-The compatibility target is Origin/OriginPro 2021–2026b; Origin 2024b (10.15) with CPython 3.10
+This fork targets and has been verified only on Origin/OriginPro 2026 (10.30) with CPython 3.12
 is the only current fully verified live baseline. Other target versions are reported after a local
 handshake, real smoke test, and template capability check. Doctor performs read-only discovery and never proves a live
 connection. Users do not need to open Origin first: the smoke test starts an EditaPlot-owned,

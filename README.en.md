@@ -7,8 +7,8 @@
     <img alt="Platform: Windows 10/11 x64 only" src="https://img.shields.io/badge/platform-Windows%2010%2F11%20x64%20only-0078d4">
     <img alt="Python 3.10–3.12" src="https://img.shields.io/badge/Python-3.10%E2%80%933.12-3776ab">
     <img alt="Codex Skill" src="https://img.shields.io/badge/Codex-Skill-7c3aed">
-    <img alt="Origin 2021–2026b compatibility target" src="https://img.shields.io/badge/Origin-2021%E2%80%932026b%20target-2563eb">
-    <img alt="Fully verified with Origin 2024b" src="https://img.shields.io/badge/fully%20verified-2024b-0f766e">
+    <img alt="Origin 2026 (10.30) verified" src="https://img.shields.io/badge/Origin-2026%20(10.30)%20verified-2563eb">
+    <img alt="Fully verified with Origin 2026" src="https://img.shields.io/badge/fully%20verified-2026-0f766e">
     <a href="https://github.com/hang-jin/editaplot"><img alt="GitHub Stars" src="https://img.shields.io/github/stars/hang-jin/editaplot?style=social"></a>
   </p>
   <p><a href="README.md">中文说明</a> · Chinese is the primary documentation language</p>
@@ -22,7 +22,7 @@ I did not want this to become a collection of rigid “replace the numbers” te
 > **I have completed full validation only on physical Windows 10/11 x64 computers.** V1 therefore does not yet provide a macOS (Intel or Apple Silicon), Linux, WSL, Wine/CrossOver, Parallels, or other virtual-machine version. If you use a Mac, this release cannot complete the Origin workflow; use a physical Windows computer and check future release notes for platform updates.
 
 > [!IMPORTANT]
-> I release EditaPlot under the [Apache License 2.0](LICENSE). The current compatibility target is Origin/OriginPro 2021–2026b. You do not need to open it first: EditaPlot starts a dedicated instance before rendering. I do not install or modify Origin.
+> I release EditaPlot under the [Apache License 2.0](LICENSE). This fork targets and has been verified only on Origin/OriginPro 2026 (10.30). You do not need to open it first: EditaPlot starts a dedicated instance before rendering. I do not install or modify Origin.
 
 ## Workflow at a glance
 
@@ -222,7 +222,7 @@ I created these palettes as original abstractions and redraws. They do not copy 
 | Item | What you need to know |
 |---|---|
 | OS | I have fully validated physical Windows 10/11 x64 computers; Mac, Linux, WSL, and VM versions are not available yet |
-| Origin | The compatibility target is Origin/OriginPro 2021–2026b; 2024b (10.15) is the only current fully verified baseline, while other target versions are reported from a local handshake, live tests, and template capabilities |
+| Origin | This fork targets and has been verified only on Origin/OriginPro 2026 (10.30); other versions are out of scope |
 | Python | You need 64-bit Python 3.10–3.12; the launcher selects it automatically, so no manual setup is needed |
 | Input | You can use CSV, TXT, XLS, or XLSX, including Chinese headers and paths |
 
@@ -364,7 +364,7 @@ The badge and trend chart use only GitHub's aggregate repository count. I do not
 
 - License: [Apache License 2.0](LICENSE)
 - Installation and troubleshooting: [docs/installation.md](docs/installation.md)
-- Origin version boundaries: [2021–2026b compatibility notes](docs/origin-2021-2026-compatibility.md)
+- Origin version boundaries: [Origin 2026 compatibility notes](docs/origin-2026-compatibility.md)
 - English quick start: [docs/quickstart.en.md](docs/quickstart.en.md)
 - Contributing: [CONTRIBUTING.md](CONTRIBUTING.md)
 - Security reports: [SECURITY.md](SECURITY.md)

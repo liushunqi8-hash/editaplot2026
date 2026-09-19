@@ -3,7 +3,7 @@
 ## The 30-second version
 
 Requirements: a physical Windows 10/11 x64 computer, 64-bit CPython 3.10–3.12, and a local
-Origin/OriginPro version in the 2021–2026b compatibility target. Origin 2024b (10.15) is the only
+Origin/OriginPro 2026 (10.30). This fork is verified only on Origin 2026 / 10.30; other versions
 current fully verified live baseline; other target versions receive a compatibility result after a
 local handshake, real smoke test, and template capability check. Origin 2020b and earlier, macOS,
 Linux, WSL, Wine/CrossOver, Parallels, and other VMs are unsupported.
