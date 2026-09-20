@@ -239,6 +239,19 @@ Before any render, read `references/origin-safety.md`, `references/figure-contra
 - Prefer editable labels and Origin objects. A Python preview or embedded bitmap is not an Origin
   deliverable.
 - Call the result “publication-informed,” never “Nature compliant” or journal-approved.
+- **Custom figure title: use a plain text box, do not fight the page-title API.** When a user
+  asks for a visible figure title and the verified template does not render one, do not burn time
+  on `layer -t` or `page.title.text$` / `page.title.show` — on some Origin versions + templates
+  these silently do not appear in the exported figure. Place a text label directly on the layer
+  with `layer.add_label(text, x, y)` (returns a Label; set font size via `set_int('font.size', n)`).
+  Coordinates are layer data coordinates:
+  - Cartesian: put it just above the axes, e.g. `add_label(title, x_min, y_max * 1.05)`, clear of
+    the legend.
+  - Polar: put it just outside the circle on the 90° ray, e.g. `add_label(title, 90, r_outer + ~10)`.
+    If a large offset gets clipped by the page, pull it back to just outside the rim; a slight
+    overlap with the 90° tick is better than a missing title.
+  This is a cosmetic overlay only; it never changes source data, column roles, or the scientific
+  contract. Verify by reading back the exported PNG, not by assuming the API call succeeded.
 
 ## Report the result in plain language
 
