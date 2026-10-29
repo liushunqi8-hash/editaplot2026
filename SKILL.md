@@ -123,8 +123,9 @@ rendering, exporting, and readback.
     technical stage and next step without speculation.
     Never use mouse automation or provide application patches or bypass instructions. The runtime
     must attempt to clean a partial EditaPlot-owned activation and may try one fresh isolated
-    instance for a retryable startup code only if cleanup succeeds. Cleanup failure returns
-    `origin_activation_cleanup_failed` and stops. It must then wait with `sec -poc 30` and confirm
+    instance for a retryable startup code only if cleanup succeeds. Cleanup failure never
+    replaces the primary activation error: the primary code stays terminal, cleanup details
+    are kept as secondary diagnostics, and no automatic retry follows. It must then wait with `sec -poc 30` and confirm
     `run.isOCready()` before reading the version or creating a project. Never loop, switch to
     `ApplicationSI`, edit DCOM/registry permissions, or tell a beginner to run the whole workflow as
     administrator. After the automatic attempt is exhausted, request approval for at most one retry
@@ -136,10 +137,12 @@ rendering, exporting, and readback.
     cancellation.
     Keep the sandbox approval handoff distinct from an activation retry: the former happens before
     COM, while the latter is available only after the bounded activation/cleanup policy has run.
-    When primary activation and cleanup both fail, expose only
+    When primary activation and cleanup both fail, expose
     `primary_activation_code`, `primary_activation_stage`, `cleanup_error_code`, and
-    `cleanup_error_stage`. Never include a Windows account name, local path, raw HRESULT, or raw COM
-    text in that structured diagnostic payload, and never retry because both pairs are present.
+    `cleanup_error_stage`, plus the desensitized HRESULT hex code in `primary_hresult` and
+    `cleanup_hresult` when one was captured. Never include a Windows account name, local path,
+    or raw COM text in that structured diagnostic payload, and never retry because both pairs
+    are present.
     Current EditaPlot workers serialize only their active `origin-smoke` / `render` Origin section
     within one signed-in Windows session; data inspection, recommendation, and planning may remain
     concurrent. Respect `origin_job_queue` progress, which is emitted immediately when waiting and

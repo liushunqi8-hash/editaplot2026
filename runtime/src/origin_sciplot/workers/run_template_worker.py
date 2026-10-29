@@ -1042,8 +1042,8 @@ def main(argv: list[str] | None = None) -> int:
                 "Origin environment error "
                 f"[{exc.code}/{exc.stage}]: {safe_error_message(exc)}"
             )
-        recovery = origin_activation_recovery(exc.code)
         diagnostics = structured_error_diagnostics(exc)
+        recovery = origin_activation_recovery(exc.code, diagnostics)
         proto.error(
             exc.code,
             safe_error_message(exc),

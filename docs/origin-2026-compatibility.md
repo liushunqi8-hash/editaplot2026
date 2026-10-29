@@ -4,7 +4,7 @@
 
 先给结论：
 
-- 这个 fork（editaplot2026 / v0.1.1）**唯一针对并实机验证于 Origin / OriginPro 2026（产品号 10.30）**。
+- 这个 fork（editaplot2026 / v1.1.0）**唯一针对并实机验证于 Origin / OriginPro 2026（产品号 10.30）**。
 - 页大小设置、对象反读和 smoke 门禁都在 Origin 2026 上完成过端到端验证，可生成可编辑 OPJU 并导出 PNG、PDF、TIF。
 - 其他 Origin 版本（2021–2025b、2026b 等）**不在本 fork 的支持范围内**；上游仓库的跨版本兼容说明不再适用于这里。
 - 默认由 EditaPlot 启动一个隔离的新 Origin 实例，不需要提前打开 Origin 窗口。
@@ -87,9 +87,9 @@ Origin 2025b 起，OriginLab 调整了图页比例、边距、字体呈现、轴
 - `origin_com_class_not_registered`：对应 `0x80040154`；
 - `origin_com_activation_access_denied`：对应 `0x80070005`。
 
-对通用或明确可重试的瞬时启动错误，EditaPlot 会先尝试退出可能存在的半启动自有实例；只有清理调用成功，才自动创建一个全新的隔离实例，最多一次。清理失败会返回 `origin_activation_cleanup_failed` 并停止。成功激活后，它执行 `sec -poc 30` 并用 `run.isOCready()` 确认 Origin C 已就绪，未就绪时不会读取版本或新建项目。类别入口不存在和访问被拒绝不会自动循环。
+对通用或明确可重试的瞬时启动错误，EditaPlot 会先尝试退出可能存在的半启动自有实例；只有清理调用成功，才自动创建一个全新的隔离实例，最多一次。清理失败不会覆盖主激活错误：主激活错误码仍为终端错误，清理细节只作为次要诊断保留，也不会因此自动重试。成功激活后，它执行 `sec -poc 30` 并用 `run.isOCready()` 确认 Origin C 已就绪，未就绪时不会读取版本或新建项目。类别入口不存在和访问被拒绝不会自动循环。
 
-如果最初启动与清理同时失败，我只让报告保留四个脱敏字段：`primary_activation_code`、`primary_activation_stage`、`cleanup_error_code` 和 `cleanup_error_stage`。这些字段不包含 Windows 账户名、本地路径、原始 HRESULT 或原始 COM 异常文本，也不会因为同时存在两组诊断而继续自动重试。
+如果最初启动与清理同时失败，我只让报告保留脱敏字段：`primary_activation_code`、`primary_activation_stage`、`cleanup_error_code` 和 `cleanup_error_stage`，以及捕获到的脱敏 HRESULT 十六进制码（`primary_hresult`、`cleanup_hresult`，仅含错误码、不含原始异常文本）。这些字段不包含 Windows 账户名、本地路径或原始 COM 异常文本，也不会因为同时存在两组诊断而继续自动重试。
 
 如果两次自动尝试都失败，EditaPlot 会停止并保留脱敏兼容报告。只有用户同意后，才允许在同一活动 Windows 用户上下文再执行一次；新的 smoke 必须使用新的空白同级输出目录，不能覆盖第一次诊断。它不会切换到 `ApplicationSI`、自动改 DCOM/注册表或把管理员模式作为普通用法。它也不会仅凭经过时间就强杀可能正在管理隐藏 Origin 的 Python worker；长时间无进度时应先保留报告并定位最后阶段。
 

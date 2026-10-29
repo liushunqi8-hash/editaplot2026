@@ -12,6 +12,7 @@ if str(RUNTIME_SRC) not in sys.path:
 from origin_sciplot.origin_backend.safe_errors import (  # noqa: E402
     OriginEnvironmentError,
     classify_origin_activation_error,
+    extract_activation_hresult,
     origin_activation_recovery,
     structured_error_diagnostics,
 )
@@ -156,6 +157,84 @@ def test_queue_timeout_recovery_preserves_active_job() -> None:
         "origin_instance_modified": False,
         "system_configuration_changes_allowed": False,
     }
+
+
+@pytest.mark.parametrize(
+    ("error", "expected"),
+    [
+        (RuntimeError(-2146959355, "private detail"), "0x80080005"),
+        (RuntimeError(0x80040154, "private detail"), "0x80040154"),
+        (RuntimeError("private detail 0x80070005"), "0x80070005"),
+        (RuntimeError("private detail"), None),
+    ],
+)
+def test_extract_activation_hresult_returns_only_the_hex_code(
+    error: BaseException, expected: str | None
+) -> None:
+    assert extract_activation_hresult(error) == expected
+
+
+def test_extract_activation_hresult_ignores_small_winerror_values() -> None:
+    class FakeError(Exception):
+        winerror = 5
+
+    assert extract_activation_hresult(FakeError("denied")) is None
+
+
+def test_structured_diagnostics_accepts_desensitized_hresult_codes() -> None:
+    error = OriginEnvironmentError(
+        "public message",
+        diagnostics={
+            "primary_hresult": "0x80080005",
+            "cleanup_hresult": "0x80070005",
+            "hresult": "0x80004005",
+            "primary_activation_code": "origin_com_server_execution_failed",
+        },
+    )
+
+    assert structured_error_diagnostics(error) == {
+        "primary_hresult": "0x80080005",
+        "cleanup_hresult": "0x80070005",
+        "hresult": "0x80004005",
+        "primary_activation_code": "origin_com_server_execution_failed",
+    }
+
+
+def test_structured_diagnostics_drops_malformed_hresult_codes() -> None:
+    error = OriginEnvironmentError(
+        "public message",
+        diagnostics={
+            "primary_hresult": "0x123",
+            "cleanup_hresult": "0x8007000a",
+            "hresult": "not-a-code",
+        },
+    )
+
+    assert structured_error_diagnostics(error) == {}
+
+
+def test_bridge_system_error_is_classified_without_hresult() -> None:
+    error = SystemError(
+        "'<built-in function ApplicationBase_LT_execute> returned a result "
+        "with an exception set'"
+    )
+
+    assert classify_origin_activation_error(error) == "origin_bridge_system_error"
+    assert extract_activation_hresult(error) is None
+
+
+def test_activation_recovery_is_blocked_by_cleanup_diagnostics() -> None:
+    assert (
+        origin_activation_recovery(
+            "origin_com_server_execution_failed",
+            {"cleanup_error_code": "origin_com_activation_access_denied"},
+        )
+        is None
+    )
+    assert (
+        origin_activation_recovery("origin_com_server_execution_failed")
+        is not None
+    )
 
 
 @pytest.mark.parametrize(

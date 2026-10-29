@@ -289,6 +289,18 @@ def _stable_stage_error(stage: str, cause: Exception) -> Exception:
     )
 
 
+def _error_carries_hresult_code(error: BaseException | None) -> bool:
+    """Return whether the error diagnostics hold a desensitized HRESULT code."""
+
+    if error is None:
+        return False
+    diagnostics = structured_error_diagnostics(error)
+    return any(
+        key in diagnostics
+        for key in ("hresult", "primary_hresult", "cleanup_hresult")
+    )
+
+
 def _safe_error_payload(error: BaseException) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "type": type(error).__name__,
@@ -386,7 +398,10 @@ def _write_compatibility_report(
         ),
         "privacy": {
             "raw_exception_included": False,
-            "hresult_included": False,
+            # True only when the error diagnostics carry a desensitized
+            # HRESULT hex code in a dedicated field. Raw exception text is
+            # never included.
+            "hresult_included": _error_carries_hresult_code(error),
             "program_path_included": False,
         },
     }

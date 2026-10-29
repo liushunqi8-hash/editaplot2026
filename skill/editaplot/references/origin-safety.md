@@ -62,9 +62,10 @@
   runtime.
 - If isolated activation partially starts and raises, perform one `op.exit()` cleanup attempt. A
   retryable code may start one fresh EditaPlot-owned `Application` instance automatically only when
-  that cleanup succeeds. Cleanup failure reports `origin_activation_cleanup_failed` and stops;
-  class-unavailable and access-denied codes also stop immediately. Do not call `set_show(True)`
-  after an entry failure.
+  that cleanup succeeds. Cleanup failure never replaces the primary activation error: the primary
+  code stays terminal, cleanup details are kept as secondary diagnostics, and no automatic retry
+  follows; class-unavailable and access-denied codes also stop immediately. Do not call
+  `set_show(True)` after an entry failure.
 - After activation, wait with `sec -poc 30` and require a finite true `run.isOCready()` value before
   version readback or project creation. A failed entry always attempts to exit the owned instance;
   keep-open applies only after `__enter__` completed. Later entry failures stop without retry even
@@ -126,10 +127,12 @@
 - Never overwrite the source or add fabricated source columns.
 - Store helper columns only in memory or the Origin workbook copy and report their purpose.
 - Redact private absolute paths and local Origin environment details from public logs and examples.
-- If activation and cleanup both fail, publish only `primary_activation_code`,
+- If activation and cleanup both fail, publish `primary_activation_code`,
   `primary_activation_stage`, `cleanup_error_code`, and `cleanup_error_stage` in the structured
-  diagnostic payload. Do not include an account name, local path, raw HRESULT, or raw COM text, and
-  do not authorize another automatic retry merely because both diagnostic pairs are present.
+  diagnostic payload, plus the desensitized HRESULT hex code in `primary_hresult` and
+  `cleanup_hresult` when one was captured. Do not include an account name, local path, or raw COM
+  text, and do not authorize another automatic retry merely because both diagnostic pairs are
+  present.
 - Keep beginner-facing environment output to one to three plain-language sentences. Store detailed
   stages, detected Automation entries, candidates, risks, probes, and failures in local structured
   diagnostics.

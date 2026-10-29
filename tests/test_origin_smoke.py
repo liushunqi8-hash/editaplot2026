@@ -371,22 +371,24 @@ def test_each_smoke_stage_failure_is_structured_and_redacted(
     }
 
 
-def test_compatibility_report_preserves_redacted_activation_cleanup_diagnostics(
+def test_compatibility_report_preserves_activation_diagnostics_with_hresult_codes(
     tmp_path: Path,
 ) -> None:
     diagnostics = {
         "primary_activation_code": "origin_com_server_execution_failed",
         "primary_activation_stage": "create_instance",
+        "primary_hresult": "0x80080005",
         "cleanup_error_code": "origin_com_activation_access_denied",
         "cleanup_error_stage": "cleanup_partial_instance",
+        "cleanup_hresult": "0x80070005",
     }
 
     class CleanupFailureContext:
         def __enter__(self) -> None:
             raise OriginEnvironmentError(
-                "Origin startup cleanup failed",
-                code="origin_activation_cleanup_failed",
-                stage="cleanup_partial_instance",
+                "Origin Automation connection failed",
+                code="origin_com_server_execution_failed",
+                stage="create_instance",
                 diagnostics=diagnostics,
             )
 
@@ -404,8 +406,10 @@ def test_compatibility_report_preserves_redacted_activation_cleanup_diagnostics(
     report_text = (output_dir / "compatibility-report.json").read_text("utf-8")
     report = json.loads(report_text)
     assert report["error"]["diagnostics"] == diagnostics
-    assert "0x80080005" not in report_text
-    assert "0x80070005" not in report_text
+    assert report["error"]["diagnostics"]["primary_hresult"] == "0x80080005"
+    assert report["error"]["diagnostics"]["cleanup_hresult"] == "0x80070005"
+    assert report["privacy"]["hresult_included"] is True
+    assert report["privacy"]["raw_exception_included"] is False
     assert "Private" not in report_text
 
 

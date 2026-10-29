@@ -70,8 +70,8 @@ def main(argv: list[str] | None = None) -> int:
                 keep_open=args.keep_origin_open,
             )
     except OriginEnvironmentError as exc:
-        recovery = origin_activation_recovery(exc.code)
         diagnostics = structured_error_diagnostics(exc)
+        recovery = origin_activation_recovery(exc.code, diagnostics)
         proto.error(
             exc.code,
             safe_error_message(exc),

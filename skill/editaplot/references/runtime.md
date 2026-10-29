@@ -153,10 +153,11 @@ holder exits, including an unexpected exit. Manual scripts, older EditaPlot rele
 programs are outside this boundary, so do not submit a duplicate smoke or render while a queue
 message is visible.
 
-If primary activation and cleanup both fail, the worker exposes only four stable diagnostic fields:
+If primary activation and cleanup both fail, the worker exposes the stable diagnostic fields
 `primary_activation_code`, `primary_activation_stage`, `cleanup_error_code`, and
-`cleanup_error_stage`. The structured payload must not contain a Windows account name, local path,
-raw HRESULT, or raw COM text. Both pairs are evidence for diagnosis, not permission for another
+`cleanup_error_stage`, plus the desensitized HRESULT hex code in `primary_hresult` and
+`cleanup_hresult` when one was captured. The structured payload must not contain a Windows account
+name, local path, or raw COM text. Both pairs are evidence for diagnosis, not permission for another
 automatic retry.
 
 ## Beginner entry point

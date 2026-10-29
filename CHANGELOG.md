@@ -1,5 +1,38 @@
 # Changelog
 
+## 1.1.0 — 2026-10-29 — Activation diagnostics keep the HRESULT code; cleanup failure no longer masks the primary error
+
+This release comes from a live support case: a user with a single Origin 2026 (10.30)
+installation, a correct COM registration, and a working desktop launch still failed at
+`create_instance`, and the public report could not say why because the safety layer deleted
+the underlying COM exception and HRESULT. Two changes fix that blind spot.
+
+### What changed
+
+- **Desensitized HRESULT codes in diagnostics.** When an activation or cleanup exception
+  carries an HRESULT, the structured diagnostic payload now keeps the normalized 8-digit hex
+  code in dedicated fields (`primary_hresult`, `cleanup_hresult`, `hresult`). Only the code is
+  kept: exception text, Windows account names, and local paths are still never included, and
+  malformed values are dropped by the normalizer. The smoke compatibility report's `privacy`
+  block now truthfully reports `hresult_included` when such a field is present.
+- **Cleanup failure no longer replaces the primary error.** When `op.exit()` fails while
+  cleaning a partial EditaPlot-owned instance, the terminal error is now the primary
+  activation error (`create_instance`) with the cleanup codes kept as secondary diagnostics,
+  instead of the terminal `origin_activation_cleanup_failed`. The no-retry rule is unchanged:
+  a failed cleanup still blocks the automatic retry, now enforced in
+  `origin_activation_recovery` via the diagnostics.
+- **Bridge-level SystemError classification.** OriginExt C-extension failures (for example
+  `ApplicationBase_LT_execute` / `ApplicationBase_Exit` raising `SystemError`) carry no HRESULT
+  at all, so they previously collapsed into the generic `origin_instance_start_failed`. They
+  now classify as `origin_bridge_system_error`, which separates a broken automation bridge
+  from COM registration, permission, and version problems.
+
+### Notes for downstream users
+
+- The `origin_activation_cleanup_failed` terminal code is retired. Support flows should read
+  the primary activation code first and treat the cleanup pair as secondary evidence.
+- The runtime package version and the desktop `__version__` are both now `1.1.0`.
+
 ## 2026-09-19 — Origin 2026 (10.30) compatibility fixes
 
 This release makes EditaPlot's native Origin route work correctly on

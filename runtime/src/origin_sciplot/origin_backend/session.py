@@ -20,6 +20,7 @@ from .capabilities import (
 from .safe_errors import (
     OriginEnvironmentError,
     classify_origin_activation_error,
+    extract_activation_hresult,
     is_retryable_origin_activation_error,
 )
 from .version_risks import ProbePriority, known_version_risks
@@ -148,10 +149,12 @@ class OriginSession:
                 break
             except Exception as exc:  # noqa: BLE001 - redact local Automation failure details
                 code = classify_origin_activation_error(exc)
+                primary_hresult = extract_activation_hresult(exc)
                 # Activation may have created a partial EditaPlot-owned
                 # instance. OriginLab's external-Python lifecycle permits
                 # best-effort Exit; its wrapper then creates a fresh
                 # Application object on the next access.
+                cleanup_diagnostics: dict[str, object] = {}
                 try:
                     op.exit()
                 except Exception as cleanup_exc:  # noqa: BLE001 - redact local details
@@ -159,29 +162,42 @@ class OriginSession:
                     # because cleanup runs inside that handler. Classify the
                     # cleanup exception itself so its stable code cannot be
                     # replaced by the already-recorded primary HRESULT.
-                    cleanup_code = classify_origin_activation_error(
+                    cleanup_diagnostics = {
+                        "cleanup_error_code": classify_origin_activation_error(
+                            cleanup_exc,
+                            include_exception_chain=False,
+                        ),
+                        "cleanup_error_stage": "cleanup_partial_instance",
+                    }
+                    cleanup_hresult = extract_activation_hresult(
                         cleanup_exc,
                         include_exception_chain=False,
                     )
-                    self._clear_failed_entry()
-                    raise OriginEnvironmentError(
-                        "Origin startup cleanup failed",
-                        code="origin_activation_cleanup_failed",
-                        stage="cleanup_partial_instance",
-                        diagnostics={
-                            "primary_activation_code": code,
-                            "primary_activation_stage": "create_instance",
-                            "cleanup_error_code": cleanup_code,
-                            "cleanup_error_stage": "cleanup_partial_instance",
-                        },
-                    ) from cleanup_exc
-                if attempt == 0 and is_retryable_origin_activation_error(code):
+                    if cleanup_hresult is not None:
+                        cleanup_diagnostics["cleanup_hresult"] = cleanup_hresult
+                # A cleanup failure is secondary evidence only. It must never
+                # replace the primary activation error as the terminal error,
+                # and it blocks the automatic retry: retrying on top of a
+                # possibly leaked partial instance would pile up instances.
+                if (
+                    attempt == 0
+                    and not cleanup_diagnostics
+                    and is_retryable_origin_activation_error(code)
+                ):
                     continue
                 self._clear_failed_entry()
+                diagnostics: dict[str, object] = {
+                    "primary_activation_code": code,
+                    "primary_activation_stage": "create_instance",
+                }
+                if primary_hresult is not None:
+                    diagnostics["primary_hresult"] = primary_hresult
+                diagnostics.update(cleanup_diagnostics)
                 raise OriginEnvironmentError(
                     "Origin Automation connection failed",
                     code=code,
                     stage="create_instance",
+                    diagnostics=diagnostics,
                 ) from exc
 
         self.ownership = SessionOwnership.EDITAPLOT

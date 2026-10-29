@@ -290,18 +290,26 @@ def test_retryable_activation_failure_stops_when_partial_cleanup_fails(
     with pytest.raises(OriginEnvironmentError) as raised:
         OriginSession().__enter__()
 
-    assert raised.value.code == "origin_activation_cleanup_failed"
-    assert raised.value.stage == "cleanup_partial_instance"
+    # A cleanup failure is secondary evidence only: the primary activation
+    # error stays terminal, and its desensitized HRESULT codes are kept in
+    # dedicated fields while private paths stay out.
+    assert raised.value.code == "origin_com_server_execution_failed"
+    assert raised.value.stage == "create_instance"
     assert raised.value.diagnostics == {
         "primary_activation_code": "origin_com_server_execution_failed",
         "primary_activation_stage": "create_instance",
+        "primary_hresult": "0x80080005",
         "cleanup_error_code": "origin_com_activation_access_denied",
         "cleanup_error_stage": "cleanup_partial_instance",
+        "cleanup_hresult": "0x80070005",
     }
     assert "Private" not in str(raised.value.diagnostics)
-    assert "0x80080005" not in str(raised.value.diagnostics)
-    assert "0x80070005" not in str(raised.value.diagnostics)
-    assert origin_activation_recovery(raised.value.code) is None
+    assert (
+        origin_activation_recovery(
+            raised.value.code, raised.value.diagnostics
+        )
+        is None
+    )
     assert attempts == 1
     assert exits == 1
 
@@ -371,15 +379,17 @@ def test_smoke_and_render_workers_preserve_stable_cleanup_diagnostics(
     diagnostics = {
         "primary_activation_code": "origin_com_server_execution_failed",
         "primary_activation_stage": "create_instance",
+        "primary_hresult": "0x80080005",
         "cleanup_error_code": "origin_com_activation_access_denied",
         "cleanup_error_stage": "cleanup_partial_instance",
+        "cleanup_hresult": "0x80070005",
     }
 
     def fail(*_args: object, **_kwargs: object) -> dict[str, object]:
         raise OriginEnvironmentError(
-            "Origin startup cleanup failed",
-            code="origin_activation_cleanup_failed",
-            stage="cleanup_partial_instance",
+            "Origin Automation connection failed",
+            code="origin_com_server_execution_failed",
+            stage="create_instance",
             diagnostics=diagnostics,
         )
 
